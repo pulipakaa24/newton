@@ -145,6 +145,7 @@ class SolverXPBD(SolverBase, CouplingInterface):
         angular_damping: float = 0.0,
         joint_legacy_relaxation: bool = False,
         joint_drive_mode: str = "pd",
+        joint_drive_relaxation: float = 1.0,
         joint_armature_inertia: str = "none",
         joint_extra_iterations: int = 0,
         joint_coloring: bool = False,
@@ -189,18 +190,20 @@ class SolverXPBD(SolverBase, CouplingInterface):
                 ``joint_angular_relaxation``.
             joint_drive_mode: How position/velocity drives (:attr:`~newton.Model.joint_target_ke`,
                 :attr:`~newton.Model.joint_target_kd`, :attr:`~newton.Model.joint_effort_limit`) are solved.
-                ``"pd"`` (default): the PD law of the state at the start of the step,
-                ``f = clamp(ke * (target_pos - q) + kd * (target_vel - qd) / (1 + kd * dt * w), +-effort_limit)``
-                (damping backward-Euler on its own effect, ``w`` the inverse inertia or mass along the axis), applied
-                as a joint force like :attr:`~newton.Control.joint_f`; ``ke`` [N/m or N·m/rad] and ``kd`` are the
-                stiffness and damping at any iteration count and static equilibria are exact. The stiffness is scaled
-                by ``1 / (1 + x^2)``, ``x = ke * dt^2 * w``, which keeps it stable on very light links (``x`` of
-                order 1 or more; model their rotor inertia with :attr:`~newton.Model.joint_armature` instead) and
-                changes it by ``O(x^2)`` otherwise. D6 joints with several rotational DOFs use ``"implicit"`` rows.
+                ``"pd"`` (default): the spring ``ke * (target_pos - q)`` of the state at the start of the step (exact
+                static equilibria at any iteration count) and a backward-Euler damper ``kd * (target_vel - qd)`` solved
+                as a constraint row on the velocity after the other joint rows, the total clamped at the effort limit.
+                A fraction ``1 / (1 + kd * dt * w)`` of the spring is applied as a joint force before the solve and the
+                rest inside the damper row (``w`` the inverse inertia or mass of the two bodies along the axis), so
+                light, heavily damped links (fingers) follow the damper instead of receiving an explicit velocity
+                kick; the explicit fraction is further scaled by ``1 / (1 + x^2)``, ``x = ke * dt^2 * w``, with the
+                remainder also moved into the row, which keeps it stable on very light links. ``ke`` [N/m or N·m/rad] and ``kd`` are the stiffness and damping.
                 ``"implicit"``: implicit (backward-Euler) PD rows with an impulse accumulated over the iterations,
                 exact when the iterations converge, stable for any gains. ``"compliance"``: the former compliance
                 rows (compliance ``1 / ke``, damping ``kd / ke``, no multiplier accumulation), whose effective
                 stiffness grows with the iteration count and which ignore the effort limit.
+            joint_drive_relaxation: Relaxation factor of the drive rows (the damper of ``"pd"``, the PD rows of
+                ``"implicit"``) [dimensionless]; a row is exact for its own DOF in one step at 1.0. Defaults to 1.0.
             joint_armature_inertia: How :attr:`~newton.Model.joint_armature` of rotational DOFs enters the dynamics:
                 ``"none"`` (default: ignored, as before; models that already add their armature to the body inertia
                 keep working), ``"isotropic"`` (``armature * I3`` added to the child body's inertia; always a valid
@@ -244,6 +247,7 @@ class SolverXPBD(SolverBase, CouplingInterface):
         if joint_drive_mode not in self._DRIVE_MODES:
             raise ValueError(f"joint_drive_mode must be one of {tuple(self._DRIVE_MODES)}, not {joint_drive_mode!r}")
         self.joint_drive_mode = joint_drive_mode
+        self.joint_drive_relaxation = joint_drive_relaxation
         if joint_armature_inertia not in ("none", "isotropic", "axis"):
             raise ValueError(
                 f"joint_armature_inertia must be 'none', 'isotropic' or 'axis', not {joint_armature_inertia!r}"
@@ -274,10 +278,14 @@ class SolverXPBD(SolverBase, CouplingInterface):
             self._body_inv_inertia = wp.empty_like(model.body_inv_inertia)
         self._joint_drive_impulse = None
         self._joint_drive_f = None
+        self._joint_drive_base = None
+        self._joint_drive_offset = None
         if model.joint_count:
             with wp.ScopedDevice(model.device):
                 self._joint_drive_impulse = wp.zeros(model.joint_count, dtype=wp.spatial_vector)
                 self._joint_drive_f = wp.zeros(model.joint_dof_count, dtype=float)
+                self._joint_drive_base = wp.zeros(model.joint_count, dtype=wp.spatial_vector)
+                self._joint_drive_offset = wp.zeros(model.joint_count, dtype=wp.spatial_vector)
 
         self.rigid_contact_relaxation = rigid_contact_relaxation
         if rigid_contact_restitution_iterations < 1:
@@ -339,6 +347,9 @@ class SolverXPBD(SolverBase, CouplingInterface):
         self._apply_module_options()
         if flags & (ModelFlags.BODY_PROPERTIES | ModelFlags.BODY_INERTIAL_PROPERTIES):
             self._refresh_kinematic_state()
+        if flags & (ModelFlags.JOINT_DOF_PROPERTIES | ModelFlags.JOINT_PROPERTIES):
+            if self.joint_armature_inertia != "none":
+                self._refresh_kinematic_state()
         if self.enable_restitution and flags & ModelFlags.SHAPE_PROPERTIES:
             self._refresh_rigid_restitution_enabled()
 
@@ -726,7 +737,6 @@ class SolverXPBD(SolverBase, CouplingInterface):
                         device=model.device,
                     )
                     if self.joint_drive_mode != "compliance":
-                        # warm start of the drive rows: stiffness force of the start state, applied like joint_f
                         wp.launch(
                             kernel=compute_joint_drive_warmstart,
                             dim=model.joint_count,
@@ -756,7 +766,12 @@ class SolverXPBD(SolverBase, CouplingInterface):
                                 self._DRIVE_MODES[self.joint_drive_mode],
                                 dt,
                             ],
-                            outputs=[self._joint_drive_f, self._joint_drive_impulse],
+                            outputs=[
+                                self._joint_drive_f,
+                                self._joint_drive_impulse,
+                                self._joint_drive_base,
+                                self._joint_drive_offset,
+                            ],
                             device=model.device,
                         )
                         wp.launch(
@@ -1066,7 +1081,16 @@ class SolverXPBD(SolverBase, CouplingInterface):
                 for _ in range(self.joint_extra_iterations):
                     for color in self._joint_color_passes:
                         body_q, body_qd, body_deltas = self._solve_joints(
-                            model, state_in, state_out, body_q, body_qd, body_deltas, control, joint_impulse, dt, color
+                            model,
+                            state_in,
+                            state_out,
+                            body_q,
+                            body_qd,
+                            body_deltas,
+                            control,
+                            joint_impulse,
+                            dt,
+                            color,
                         )
 
             self._contact_impulse = contact_impulse
@@ -1292,7 +1316,17 @@ class SolverXPBD(SolverBase, CouplingInterface):
                 self.copy_kinematic_body_state(model, state_in, state_out)
 
     def _solve_joints(
-        self, model, state_in, state_out, body_q, body_qd, body_deltas, control, joint_impulse, dt, color
+        self,
+        model,
+        state_in,
+        state_out,
+        body_q,
+        body_qd,
+        body_deltas,
+        control,
+        joint_impulse,
+        dt,
+        color,
     ):
         """One joint pass: all joints (``color`` -1) or the joints of one color (``joint_coloring``), then apply."""
         requires_grad = state_in.requires_grad
@@ -1334,6 +1368,9 @@ class SolverXPBD(SolverBase, CouplingInterface):
                 self._DRIVE_MODES[self.joint_drive_mode],
                 model.joint_effort_limit,
                 self._joint_drive_impulse,
+                self._joint_drive_base,
+                self._joint_drive_offset,
+                self.joint_drive_relaxation,
                 self._joint_color,
                 color,
                 dt,

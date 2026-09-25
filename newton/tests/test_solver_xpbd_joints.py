@@ -270,6 +270,44 @@ def test_body_contact_force_is_exact_on_a_stack(test, device):
     test.assertIsNone(newton.solvers.SolverXPBD(model).body_contact_force)
 
 
+def test_joint_drive_light_damped_chain(test, device):
+    """Overdamped light chain (3 links of 8 g, ke 40, kd 10, armature 0.001) stepped by 0.3 rad in zero gravity:
+    each joint creeps first-order, q(t) = 0.3 (1 - exp(-t ke / kd)) (0.0544 rad at 50 ms). A damper evaluated on the
+    joint's own inertia would let such links move several times faster."""
+    builder = newton.ModelBuilder(gravity=0.0)
+    parent, joints = -1, []
+    for i in range(3):
+        link = builder.add_link(xform=wp.transform((0.03 * i, 0.0, 1.0), wp.quat_identity()), mass=0.0)
+        builder.add_shape_box(
+            link, xform=wp.transform((0.015, 0.0, 0.0), wp.quat_identity()), hx=0.015, hy=0.008, hz=0.008
+        )
+        joints.append(
+            builder.add_joint_revolute(
+                parent,
+                link,
+                parent_xform=wp.transform((0.03 if i else 0.0, 0.0, 0.0 if i else 1.0), wp.quat_identity()),
+                axis=(0.0, 1.0, 0.0),
+                target_ke=40.0,
+                target_kd=10.0,
+                target_pos=0.3,
+                armature=0.001,
+            )
+        )
+        parent = link
+    builder.add_articulation(joints)
+    model = builder.finalize(device=device)
+    solver = newton.solvers.SolverXPBD(model, iterations=4, joint_armature_inertia="isotropic", joint_coloring=True)
+    s0, s1, control = model.state(), model.state(), model.control()
+    newton.eval_fk(model, model.joint_q, model.joint_qd, s0)
+    for _ in range(40):
+        solver.step(s0, s1, control, None, 1.25e-3)
+        s0, s1 = s1, s0
+    q = wp.zeros(3, dtype=float, device=device)
+    qd = wp.zeros(3, dtype=float, device=device)
+    newton.eval_ik(model, s0, q, qd)
+    np.testing.assert_allclose(q.numpy(), 0.3 * (1.0 - np.exp(-0.05 * 40.0 / 10.0)), rtol=0.1)
+
+
 devices = get_test_devices()
 
 
@@ -352,6 +390,13 @@ add_function_test(
     TestSolverXPBDJoints,
     "test_body_contact_force_is_exact_on_a_stack",
     test_body_contact_force_is_exact_on_a_stack,
+    devices=devices,
+    check_output=False,
+)
+add_function_test(
+    TestSolverXPBDJoints,
+    "test_joint_drive_light_damped_chain",
+    test_joint_drive_light_damped_chain,
     devices=devices,
     check_output=False,
 )

@@ -1557,6 +1557,8 @@ def solve_simple_body_joints(
 
 @wp.func
 def joint_drive_delta_impulse(
+    base: float,
+    offset: float,
     impulse: float,
     err: float,
     derr: float,
@@ -1573,11 +1575,12 @@ def joint_drive_delta_impulse(
     correction, with ``err`` the position error and ``derr`` the rate error along the row and ``inv_mass`` the
     row's inverse effective mass. Solving ``impulse + d = dt * f(err + inv_mass * dt * d, derr + inv_mass * d)``
     for ``d`` gives the expression below; its fixed point ``impulse = -dt * (ke * err + kd * derr)`` does not depend
-    on the iteration count or on ``relaxation``, which only scales the step. The accumulated impulse is clamped to
-    ``+-max_impulse`` (effort limit times ``dt``).
+    on the iteration count or on ``relaxation``, which only scales the step. ``base`` is a drive impulse applied
+    outside the rows (the explicit spring of ``joint_drive_mode="pd"``) that counts towards the effort limit: the
+    total ``base + impulse`` is clamped to ``+-max_impulse`` (effort limit times ``dt``).
     """
-    d = -(impulse + dt * (ke * err + kd * derr)) / (1.0 + (dt * dt * ke + dt * kd) * inv_mass)
-    return wp.clamp(impulse + relaxation * d, -max_impulse, max_impulse) - impulse
+    d = -(impulse - offset + dt * (ke * err + kd * derr)) / (1.0 + (dt * dt * ke + dt * kd) * inv_mass)
+    return wp.clamp(base + impulse + relaxation * d, -max_impulse, max_impulse) - base - impulse
 
 
 @wp.func
@@ -1689,6 +1692,8 @@ def compute_joint_drive_warmstart(
     # outputs
     drive_f: wp.array[float],
     drive_impulse: wp.array[wp.spatial_vector],
+    drive_base: wp.array[wp.spatial_vector],
+    drive_offset: wp.array[wp.spatial_vector],
 ):
     """Explicit stiffness part of the joint drives at the start of the step, ``clamp(ke * (target - q), +-effort)``
     per DOF (applied like ``Control.joint_f``) and the matching initial accumulated impulse per constraint row
@@ -1696,6 +1701,8 @@ def compute_joint_drive_warmstart(
     the equilibrium is exact at any iteration count. Rows of D6 joints with several rotational DOFs start at zero."""
     tid = wp.tid()
     drive_impulse[tid] = wp.spatial_vector()
+    drive_base[tid] = wp.spatial_vector()
+    drive_offset[tid] = wp.spatial_vector()
     type = joint_type[tid]
     qd_start = joint_qd_start[tid]
     lin_axis_count = joint_dof_dim[tid, 0]
@@ -1718,6 +1725,8 @@ def compute_joint_drive_warmstart(
     rel = wp.transform_inverse(X_wp) * X_wc
     lin = wp.vec3(0.0)
     ang = wp.vec3(0.0)
+    lin_row = wp.vec3(0.0)
+    ang_row = wp.vec3(0.0)
     n = lin_axis_count
     if ang_axis_count == 1:
         n += 1
@@ -1725,7 +1734,7 @@ def compute_joint_drive_warmstart(
         idx = qd_start + k
         ke = joint_target_ke[idx]
         kd = joint_target_kd[idx]
-        if (drive_mode == 1 and ke > 0.0) or (drive_mode == 2 and (ke > 0.0 or kd > 0.0)):
+        if ke > 0.0:
             axis = wp.normalize(joint_axis[idx])
             lower = joint_limit_lower[idx]
             upper = joint_limit_upper[idx]
@@ -1754,33 +1763,33 @@ def compute_joint_drive_warmstart(
                 # warm start of the implicit rows: stable fraction of the explicit stiffness force
                 f = f / (1.0 + x)
             else:
-                # drive_mode 2: PD law of the start state, applied as a force: stiffness explicit, damping backward-Euler
-                # on its own effect; exact at rest whatever the load. An explicit spring diverges when ke dt^2 w
-                # approaches 4 (light links, e.g. fingers, without armature): scaling it by 1 / (1 + x^2),
-                # x = ke dt^2 w, keeps the per-step gain x / (1 + x^2) <= 0.5 and changes it by O(x^2) where x << 1.
-                qd = float(0.0)
+                # drive_mode 2: the spring of the start state (exact at rest whatever the load), split in two:
+                #   alpha = 1 / (1 + kd dt w) of it is applied as a force before the solve, the rest inside the drive's
+                #   damper row (solve_body_joints), which enforces impulse = spring - dt kd qd on the velocity it sees
+                #   (spring, gravity, joint coupling included). An explicit spring alone would give a light, heavily
+                #   damped link (kd dt w >> 1, e.g. fingers) a velocity kick that the coupled damper rows cannot remove
+                #   within a few iterations (5x too fast in a step response); a spring entirely in the row biases the
+                #   statics of heavy links, which the row sees mid-iteration.
+                # The explicit part is further scaled by 1 / (1 + x^2), x = ke dt^2 w (an explicit spring diverges when
+                # x approaches 4: light links without armature); what it removes also goes into the row, so the
+                # total spring is unchanged.
+                f = wp.clamp(ke * (target - q), -eff, eff)
+                f_explicit = f / ((1.0 + kd * dt * w) * (1.0 + x * x))
                 if k < lin_axis_count:
-                    x_anchor = wp.transform_get_translation(X_wc)
-                    v_c = velocity_at_point(body_qd[id_c], x_anchor - wp.transform_point(body_q[id_c], body_com[id_c]))
-                    v_p = wp.vec3(0.0)
-                    if id_p >= 0:
-                        v_p = velocity_at_point(
-                            body_qd[id_p], x_anchor - wp.transform_point(body_q[id_p], body_com[id_p])
-                        )
-                    qd = wp.dot(v_c - v_p, a_w)
+                    lin_row += axis * ((f - f_explicit) * dt)
                 else:
-                    w_rel = wp.spatial_bottom(body_qd[id_c])
-                    if id_p >= 0:
-                        w_rel -= wp.spatial_bottom(body_qd[id_p])
-                    qd = wp.dot(w_rel, a_w)
-                f = ke * (target - q) / (1.0 + x * x) + kd * (joint_target_qd[idx] - qd) / (1.0 + kd * dt * w)
-                f = wp.clamp(f, -eff, eff)
+                    ang_row += axis * ((f - f_explicit) * dt)
+                f = f_explicit
             drive_f[idx] = f
             if k < lin_axis_count:
                 lin += axis * (f * dt)
             else:
                 ang += axis * (f * dt)
-    drive_impulse[tid] = wp.spatial_vector(lin, ang)
+    if drive_mode == 1:
+        drive_impulse[tid] = wp.spatial_vector(lin, ang)
+    else:
+        drive_base[tid] = wp.spatial_vector(lin, ang)
+        drive_offset[tid] = wp.spatial_vector(lin_row, ang_row)
 
 
 @wp.kernel
@@ -1814,6 +1823,9 @@ def solve_body_joints(
     drive_mode: int,
     joint_effort_limit: wp.array[float],
     drive_impulse: wp.array[wp.spatial_vector],
+    drive_base: wp.array[wp.spatial_vector],
+    drive_offset: wp.array[wp.spatial_vector],
+    drive_relaxation: float,
     joint_color: wp.array[wp.int32],
     color: int,
     dt: float,
@@ -1885,8 +1897,6 @@ def solve_body_joints(
 
     # accumulated drive impulses of this joint's rows (drive_mode 1), written back at the end
     drive_accum = wp.spatial_vector()
-    if drive_mode >= 1:
-        drive_accum = drive_impulse[tid]
     # drive rows found by the loops below, solved last (Gauss-Seidel after this joint's hard rows)
     lin_drive_on = wp.vec3(0.0)
     lin_drive_err = wp.vec3(0.0)
@@ -2124,9 +2134,7 @@ def solve_body_joints(
                 target_pos = axis_target_pos[dim]
                 target_pos = wp.clamp(target_pos, lower, upper)
 
-                if drive_mode == 2 and (axis_stiffness[dim] > 0.0 or axis_damping[dim] > 0.0):
-                    err = 0.0  # applied as a force at the start of the step (compute_joint_drive_warmstart)
-                elif drive_mode == 1 and (axis_stiffness[dim] > 0.0 or axis_damping[dim] > 0.0):
+                if drive_mode >= 1 and (axis_stiffness[dim] > 0.0 or axis_damping[dim] > 0.0):
                     is_drive = True
                     err = e - target_pos
                 elif axis_stiffness[dim] > 0.0:
@@ -2143,6 +2151,8 @@ def solve_body_joints(
                 lin_drive_err[dim] = err
                 lin_drive_derr[dim] = derr_rel
                 lin_drive_ke[dim] = axis_stiffness[dim]
+                if drive_mode == 2:
+                    lin_drive_ke[dim] = 0.0  # the spring is applied explicitly (compute_joint_drive_warmstart)
                 lin_drive_kd[dim] = axis_damping[dim]
                 lin_drive_max[dim] = axis_effort[dim] * dt
                 for i in range(3):
@@ -2370,10 +2380,7 @@ def solve_body_joints(
                 target_pos = axis_target_pos[dim]
                 target_pos = wp.clamp(target_pos, lower, upper)
 
-                if drive_mode == 2 and ang_axis_count <= 1 and (axis_stiffness[dim] > 0.0 or axis_damping[dim] > 0.0):
-                    err = 0.0  # applied as a force at the start of the step (compute_joint_drive_warmstart)
-                elif drive_mode >= 1 and (axis_stiffness[dim] > 0.0 or axis_damping[dim] > 0.0):
-                    # drive_mode 2 cannot evaluate several coupled rotational DOFs at the start of the step: rows
+                if drive_mode >= 1 and (axis_stiffness[dim] > 0.0 or axis_damping[dim] > 0.0):
                     is_drive = True
                     err = e - target_pos
                 elif axis_stiffness[dim] > 0.0:
@@ -2399,6 +2406,8 @@ def solve_body_joints(
                 ang_drive_err[dim] = err
                 ang_drive_derr[dim] = derr_rel
                 ang_drive_ke[dim] = axis_stiffness[dim]
+                if drive_mode == 2 and ang_axis_count <= 1:
+                    ang_drive_ke[dim] = 0.0  # the spring is applied explicitly (compute_joint_drive_warmstart)
                 ang_drive_kd[dim] = axis_damping[dim]
                 ang_drive_max[dim] = axis_effort[dim] * dt
                 for i in range(3):
@@ -2426,7 +2435,9 @@ def solve_body_joints(
             ang_delta_p += angular_p * d_lambda
             ang_delta_c += angular_c * d_lambda
 
-    if drive_mode >= 1:
+    n_drive_rows = wp.dot(lin_drive_on, wp.vec3(1.0)) + wp.dot(ang_drive_on, wp.vec3(1.0))
+    if n_drive_rows > 0.0:
+        drive_accum = drive_impulse[tid]
         # Drive rows, Gauss-Seidel after the hard rows of this joint: their error and rate include the effect of
         # the corrections already accumulated above (otherwise a drive would, e.g., damp the rotation about the
         # child COM that the anchor rows turn into a rotation about the pivot in the same iteration, and settle
@@ -2447,7 +2458,11 @@ def solve_body_joints(
                 )
                 w = m_inv_p + m_inv_c + wp.dot(a_c, W_c * a_c) + wp.dot(a_p, W_p * a_p)
                 impulse = spatial_get(drive_accum, dim)
+                base = spatial_get(drive_base[tid], dim)
+                offset = spatial_get(drive_offset[tid], dim)
                 d = joint_drive_delta_impulse(
+                    base,
+                    offset,
                     impulse,
                     lin_drive_err[dim] + dt * dv,
                     lin_drive_derr[dim] + dv,
@@ -2455,7 +2470,7 @@ def solve_body_joints(
                     lin_drive_ke[dim],
                     lin_drive_kd[dim],
                     lin_drive_max[dim],
-                    linear_relaxation,
+                    drive_relaxation,
                     dt,
                 )
                 drive_accum[dim] = impulse + d
@@ -2469,7 +2484,11 @@ def solve_body_joints(
                 dw = wp.dot(a, W_c * ang_delta_c) - wp.dot(a, W_p * ang_delta_p)
                 w = wp.dot(a, W_c * a) + wp.dot(a, W_p * a)
                 impulse = spatial_get(drive_accum, 3 + dim)
+                base = spatial_get(drive_base[tid], 3 + dim)
+                offset = spatial_get(drive_offset[tid], 3 + dim)
                 d = joint_drive_delta_impulse(
+                    base,
+                    offset,
                     impulse,
                     ang_drive_err[dim] + dt * dw,
                     ang_drive_derr[dim] + dw,
@@ -2477,7 +2496,7 @@ def solve_body_joints(
                     ang_drive_ke[dim],
                     ang_drive_kd[dim],
                     ang_drive_max[dim],
-                    angular_relaxation,
+                    drive_relaxation,
                     dt,
                 )
                 drive_accum[3 + dim] = impulse + d
