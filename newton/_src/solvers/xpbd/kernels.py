@@ -1789,6 +1789,7 @@ def compute_joint_drive_warmstart(
     drive_base: wp.array[wp.spatial_vector],
     drive_offset: wp.array[wp.spatial_vector],
     drive_force: wp.array[float],
+    drive_hinge: wp.array[wp.vec4],
 ):
     """Spring part of the joint drives from the state at the start of the step, per drive DOF (slots: linear DOFs
     0..2, the rotational DOF of a joint with one rotational DOF 3; D6 joints with several rotational DOFs keep
@@ -1814,13 +1815,14 @@ def compute_joint_drive_warmstart(
     n = lin_axis_count
     if ang_axis_count == 1:
         n += 1
-    any_ke = bool(False)
+    any_drive = bool(False)
     for k in range(n):
-        if joint_target_ke[qd_start + k] > 0.0:
-            any_ke = True
+        if joint_target_ke[qd_start + k] > 0.0 or joint_target_kd[qd_start + k] > 0.0:
+            any_drive = True
     for k in range(n):
         drive_force[qd_start + k] = 0.0
-    if not any_ke or not joint_enabled[tid]:
+    drive_hinge[tid] = wp.vec4(0.0, 0.0, 0.0, -1.0)
+    if not any_drive or not joint_enabled[tid]:
         drive_impulse[tid] = wp.spatial_vector()
         drive_base[tid] = wp.spatial_vector()
         drive_offset[tid] = wp.spatial_vector()
@@ -1843,7 +1845,7 @@ def compute_joint_drive_warmstart(
     for k in range(n):
         idx = qd_start + k
         ke = joint_target_ke[idx]
-        if ke > 0.0:
+        if ke > 0.0 or joint_target_kd[idx] > 0.0:
             linear = int(0)
             slot = int(3)
             if k < lin_axis_count:
@@ -1859,6 +1861,10 @@ def compute_joint_drive_warmstart(
             w, ang_p, ang_c = joint_drive_row_inv_mass(
                 body_q, body_com, body_inv_m, body_inv_I, id_p, id_c, a_w, x_anchor, linear
             )
+            if linear == 0 and lin_axis_count == 0:
+                # a hinge's drive row data for this step (solve_joint_drive_rows' fast path under "pd"): world axis and
+                # inverse inertia along it
+                drive_hinge[tid] = wp.vec4(a_w[0], a_w[1], a_w[2], w)
             eff = joint_effort_limit[idx]
             f = wp.clamp(ke * (target - q), -eff, eff)
             x = ke * dt * dt * w
@@ -1924,6 +1930,7 @@ def solve_joint_drive_rows(
     deltas: wp.array[wp.spatial_vector],
     joint_impulse: wp.array[wp.spatial_vector],
     drive_force: wp.array[float],
+    drive_hinge: wp.array[wp.vec4],
 ):
     """Drive rows (see :func:`joint_drive_delta_impulse`), one per drive DOF, Gauss-Seidel after the joint's hard rows
     of the same pass (``pending_p``/``pending_c``): their error and rate include the effect of those corrections
@@ -1951,6 +1958,60 @@ def solve_joint_drive_rows(
         return
     id_p = joint_parent[tid]
     id_c = joint_child[tid]
+    if drive_mode == 2 and lin_axis_count == 0:
+        # hinge under "pd": the row needs only the rate (the spring is a constant offset); axis, inverse inertia and
+        # the limit test come from the start of the step (compute_joint_drive_warmstart)
+        hinge = drive_hinge[tid]
+        w_h = hinge[3]
+        if w_h <= 0.0:
+            return
+        a = wp.vec3(hinge[0], hinge[1], hinge[2])
+        idx = qd_start
+        rot_c = wp.transform_get_rotation(body_q[id_c])
+        # angle this iteration, for the limit test (outside the limits the limit row of solve_body_joints acts)
+        lower = joint_limit_lower[idx]
+        upper = joint_limit_upper[idx]
+        q_wp = wp.transform_get_rotation(joint_X_p[tid])
+        if id_p >= 0:
+            q_wp = wp.transform_get_rotation(body_q[id_p]) * q_wp
+        q_rel = wp.quat_inverse(q_wp) * (rot_c * wp.transform_get_rotation(joint_X_c[tid]))
+        target = wp.clamp(joint_target_q[joint_target_q_start[tid]], lower, upper)
+        q = wrap_angle_near(
+            wp.quat_twist_angle_signed(wp.normalize(joint_axis[idx]), q_rel), joint_drive_ref(lower, upper, target)
+        )
+        if q < lower or q > upper:
+            return
+        w_rel = wp.spatial_bottom(body_qd[id_c])
+        dv = wp.dot(a, world_inv_inertia_times(rot_c, body_inv_I[id_c], wp.spatial_bottom(pending_c[tid])))
+        if id_p >= 0:
+            rot_p = wp.transform_get_rotation(body_q[id_p])
+            w_rel -= wp.spatial_bottom(body_qd[id_p])
+            dv -= wp.dot(a, world_inv_inertia_times(rot_p, body_inv_I[id_p], wp.spatial_bottom(pending_p[tid])))
+        impulse_acc = drive_impulse[tid]
+        impulse = impulse_acc[3]
+        base_h = drive_base[tid][3]
+        d = joint_drive_delta_impulse(
+            base_h,
+            drive_offset[tid][3],
+            impulse,
+            0.0,
+            wp.dot(w_rel, a) - joint_target_qd[idx] + dv,
+            w_h,
+            0.0,
+            joint_target_kd[idx],
+            joint_effort_limit[idx] * dt,
+            drive_relaxation,
+            dt,
+        )
+        impulse_acc[3] = impulse + d
+        drive_impulse[tid] = impulse_acc
+        drive_force[idx] = (base_h + impulse + d) / dt
+        wp.atomic_add(deltas, id_c, wp.spatial_vector(wp.vec3(0.0), a * d))
+        if id_p >= 0:
+            wp.atomic_add(deltas, id_p, wp.spatial_vector(wp.vec3(0.0), -a * d))
+        if joint_impulse:
+            wp.atomic_add(joint_impulse, tid, wp.spatial_vector(wp.vec3(0.0), a * d))
+        return
     m_inv_p = float(0.0)
     I_inv_p = wp.mat33(0.0)
     rot_p = wp.quat_identity()
