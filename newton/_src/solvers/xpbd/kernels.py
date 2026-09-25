@@ -1679,6 +1679,12 @@ def joint_drive_dof_state(
 
 
 @wp.func
+def world_inv_inertia_times(q: wp.quat, inv_I: wp.mat33, v: wp.vec3) -> wp.vec3:
+    """``R inv_I R^T v`` for a body with orientation ``q``."""
+    return wp.quat_rotate(q, inv_I * wp.quat_rotate_inv(q, v))
+
+
+@wp.func
 def joint_drive_row_inv_mass(
     body_q: wp.array[wp.transform],
     body_com: wp.array[wp.vec3],
@@ -1702,11 +1708,9 @@ def joint_drive_row_inv_mass(
         if id_p >= 0:
             ang_p = -wp.cross(x_anchor - wp.transform_point(body_q[id_p], body_com[id_p]), a_w)
             w += body_inv_m[id_p]
-    R_c = wp.quat_to_matrix(wp.transform_get_rotation(body_q[id_c]))
-    w += wp.dot(ang_c, R_c * (body_inv_I[id_c] * (wp.transpose(R_c) * ang_c)))
+    w += wp.dot(ang_c, world_inv_inertia_times(wp.transform_get_rotation(body_q[id_c]), body_inv_I[id_c], ang_c))
     if id_p >= 0:
-        R_p = wp.quat_to_matrix(wp.transform_get_rotation(body_q[id_p]))
-        w += wp.dot(ang_p, R_p * (body_inv_I[id_p] * (wp.transpose(R_p) * ang_p)))
+        w += wp.dot(ang_p, world_inv_inertia_times(wp.transform_get_rotation(body_q[id_p]), body_inv_I[id_p], ang_p))
     return w, ang_p, ang_c
 
 
@@ -1940,20 +1944,19 @@ def solve_joint_drive_rows(
     id_c = joint_child[tid]
     m_inv_p = float(0.0)
     I_inv_p = wp.mat33(0.0)
-    R_p = wp.identity(3, dtype=float)
+    rot_p = wp.quat_identity()
     X_wp = joint_X_p[tid]
     if id_p >= 0:
         X_wp = body_q[id_p] * X_wp
         m_inv_p = body_inv_m[id_p]
         I_inv_p = body_inv_I[id_p]
-        R_p = wp.quat_to_matrix(wp.transform_get_rotation(body_q[id_p]))
+        rot_p = wp.transform_get_rotation(body_q[id_p])
     if m_inv_p == 0.0 and body_inv_m[id_c] == 0.0:
         return
     X_wc = body_q[id_c] * joint_X_c[tid]
     x_anchor = wp.transform_get_translation(X_wc)
-    R_c = wp.quat_to_matrix(wp.transform_get_rotation(body_q[id_c]))
-    W_p = R_p * I_inv_p * wp.transpose(R_p)
-    W_c = R_c * body_inv_I[id_c] * wp.transpose(R_c)
+    rot_c = wp.transform_get_rotation(body_q[id_c])
+    I_inv_c = body_inv_I[id_c]
     pp = pending_p[tid]
     pc = pending_c[tid]
     lin_p = wp.spatial_top(pp)
@@ -1991,7 +1994,9 @@ def solve_joint_drive_rows(
                     body_q, body_com, body_inv_m, body_inv_I, id_p, id_c, a_w, x_anchor, linear
                 )
                 # rate change from the corrections already pending for the two bodies in this pass
-                dv = wp.dot(ang_c, W_c * (ang_c_acc + d_ang_c)) + wp.dot(ang_p, W_p * (ang_p_acc + d_ang_p))
+                dv = wp.dot(ang_c, world_inv_inertia_times(rot_c, I_inv_c, ang_c_acc + d_ang_c)) + wp.dot(
+                    ang_p, world_inv_inertia_times(rot_p, I_inv_p, ang_p_acc + d_ang_p)
+                )
                 if linear != 0:
                     dv += wp.dot(a_w, (lin_c + d_lin_c) * body_inv_m[id_c] - (lin_p + d_lin_p) * m_inv_p)
                 ke_row = ke
