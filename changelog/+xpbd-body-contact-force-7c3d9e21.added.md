@@ -1,0 +1,1 @@
+Add `SolverXPBD(body_contact_forces=True)` and `SolverXPBD.body_contact_force`: the net rigid-contact force (total and normal-only) on every body during the last step, from the contact impulses with the exact per-body contact weighting.

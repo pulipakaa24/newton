@@ -4,15 +4,17 @@
 import warnings
 from typing import ClassVar
 
+import numpy as np
 import warp as wp
 
 from ...core.types import override
-from ...sim import Contacts, Control, Model, ModelFlags, State
+from ...sim import Contacts, Control, JointType, Model, ModelFlags, State
 from ...sim.joint_mimic import has_supported_joint_mimics
 from ..coupled.interface import CouplingInterface
 from ..solver import SolverBase, integrate_bodies
 from . import kernels, restitution_kernels
 from .kernels import (
+    accumulate_body_contact_impulse,
     accumulate_weighted_contact_impulse,
     add_joint_armature_inertia,
     apply_body_delta_velocities,
@@ -26,6 +28,7 @@ from .kernels import (
     convert_joint_impulse_to_parent_f,
     copy_kinematic_body_state_kernel,
     invert_body_inertia,
+    scale_spatial_vectors,
     solve_body_contact_positions,
     solve_body_joints,
     solve_joint_mimics,
@@ -143,6 +146,9 @@ class SolverXPBD(SolverBase, CouplingInterface):
         joint_legacy_relaxation: bool = False,
         joint_drive_mode: str = "pd",
         joint_armature_inertia: str = "none",
+        joint_extra_iterations: int = 0,
+        joint_coloring: bool = False,
+        body_contact_forces: bool = False,
         enable_restitution: bool = False,
         deterministic: wp.DeterministicMode | None = None,
     ):
@@ -201,6 +207,14 @@ class SolverXPBD(SolverBase, CouplingInterface):
                 inertia; recommended with ``joint_drive_mode="pd"`` and stiff drives on light links) or ``"axis"`` (``armature * a a^T`` about the joint axis; may violate
                 the triangle inequality of the inertia). Maximal coordinates cannot represent a rotor exactly; both
                 are approximations that are exact about the axis when the parent is fixed.
+            joint_extra_iterations: Number of joint-only passes after the ``iterations`` passes of contacts and
+                joints [dimensionless]. Defaults to 0.
+            joint_coloring: Whether to solve the joints Gauss-Seidel by color: joints are partitioned so that no two
+                joints of a color share a body, and each color is solved and applied in turn (as many passes as the
+                largest number of joints on one body). Otherwise all joints are solved at once and their corrections
+                summed per body (Jacobi). Defaults to ``False``.
+            body_contact_forces: Whether to record the net rigid-contact force on every body during :meth:`step`,
+                available afterwards as :attr:`body_contact_force`. Defaults to ``False``.
             enable_restitution: Whether to apply restitution to rigid and particle-shape contacts after the
                 positional solve. Defaults to ``False``.
             deterministic: Opt-in determinism for this solver's atomic-emitting
@@ -235,6 +249,24 @@ class SolverXPBD(SolverBase, CouplingInterface):
                 f"joint_armature_inertia must be 'none', 'isotropic' or 'axis', not {joint_armature_inertia!r}"
             )
         self.joint_armature_inertia = joint_armature_inertia
+        self.joint_extra_iterations = int(joint_extra_iterations)
+        self._body_contact_impulse_iter = None
+        self._body_contact_impulse = None
+        self._body_contact_force = None
+        if body_contact_forces and model.body_count:
+            with wp.ScopedDevice(model.device):
+                self._body_contact_impulse_iter = wp.zeros(model.body_count, dtype=wp.spatial_vector)
+                self._body_contact_impulse = wp.zeros(model.body_count, dtype=wp.spatial_vector)
+                self._body_contact_force = wp.zeros(model.body_count, dtype=wp.spatial_vector)
+        self.joint_coloring = bool(joint_coloring)
+        self._joint_color = None
+        self._joint_color_passes = [-1]
+        if model.joint_count:
+            colors = np.zeros(model.joint_count, dtype=np.int32)
+            if joint_coloring:
+                colors = self._color_joints(model)
+                self._joint_color_passes = list(range(int(colors.max()) + 1))
+            self._joint_color = wp.array(colors, dtype=wp.int32, device=model.device)
         self._body_inertia = model.body_inertia
         self._body_inv_inertia = model.body_inv_inertia
         if joint_armature_inertia != "none" and model.body_count:
@@ -309,6 +341,28 @@ class SolverXPBD(SolverBase, CouplingInterface):
             self._refresh_kinematic_state()
         if self.enable_restitution and flags & ModelFlags.SHAPE_PROPERTIES:
             self._refresh_rigid_restitution_enabled()
+
+    @staticmethod
+    def _color_joints(model: Model) -> np.ndarray:
+        """Greedy edge coloring of the joint graph: joints of one color share no dynamic body (FREE joints and the
+        world do not count)."""
+        parent = model.joint_parent.numpy()
+        child = model.joint_child.numpy()
+        jtype = model.joint_type.numpy()
+        used: dict[int, set[int]] = {}
+        colors = np.zeros(model.joint_count, dtype=np.int32)
+        for j in range(model.joint_count):
+            if jtype[j] == JointType.FREE:
+                continue
+            bodies = [b for b in (int(parent[j]), int(child[j])) if b >= 0]
+            taken = set().union(*(used.get(b, set()) for b in bodies))
+            c = 0
+            while c in taken:
+                c += 1
+            colors[j] = c
+            for b in bodies:
+                used.setdefault(b, set()).add(c)
+        return colors
 
     def _refresh_kinematic_state(self):
         super()._refresh_kinematic_state()
@@ -746,6 +800,9 @@ class SolverXPBD(SolverBase, CouplingInterface):
             if model.edge_count:
                 edge_constraint_lambdas = wp.empty_like(model.edge_rest_angle)
 
+            if self._body_contact_impulse is not None:
+                self._body_contact_impulse.zero_()
+                self._body_contact_impulse_iter.zero_()
             for i in range(self.iterations):
                 with wp.ScopedTimer(f"iteration_{i}", False):
                     if model.body_count:
@@ -947,9 +1004,18 @@ class SolverXPBD(SolverBase, CouplingInterface):
                                 body_deltas,
                                 rigid_contact_inv_weight,
                                 contact_impulse_iter,
+                                self._body_contact_impulse_iter,
                             ],
                             device=model.device,
                         )
+                        if self._body_contact_impulse is not None:
+                            wp.launch(
+                                kernel=accumulate_body_contact_impulse,
+                                dim=model.body_count,
+                                inputs=[self._body_contact_impulse_iter, rigid_contact_inv_weight],
+                                outputs=[self._body_contact_impulse],
+                                device=model.device,
+                            )
 
                         if contact_impulse_iter is not None:
                             wp.launch(
@@ -981,83 +1047,37 @@ class SolverXPBD(SolverBase, CouplingInterface):
                         )
 
                     if model.joint_count:
-                        if requires_grad:
-                            body_deltas = wp.zeros_like(body_deltas)
-                        else:
-                            body_deltas.zero_()
-
-                        wp.launch(
-                            kernel=solve_body_joints,
-                            dim=model.joint_count,
-                            inputs=[
+                        for color in self._joint_color_passes:
+                            body_q, body_qd, body_deltas = self._solve_joints(
+                                model,
+                                state_in,
+                                state_out,
                                 body_q,
                                 body_qd,
-                                model.body_com,
-                                self.body_inv_mass_effective,
-                                self.body_inv_inertia_effective,
-                                model.joint_type,
-                                model.joint_enabled,
-                                model.joint_parent,
-                                model.joint_child,
-                                model.joint_X_p,
-                                model.joint_X_c,
-                                model.joint_limit_lower,
-                                model.joint_limit_upper,
-                                model.joint_qd_start,
-                                model.joint_target_q_start,
-                                model.joint_dof_dim,
-                                model.joint_axis,
-                                control.joint_target_q,
-                                control.joint_target_qd,
-                                model.joint_target_ke,
-                                model.joint_target_kd,
-                                self.joint_linear_compliance,
-                                self.joint_angular_compliance,
-                                self.joint_angular_relaxation,
-                                self.joint_linear_relaxation,
-                                self.joint_angular_relaxation
-                                if self.joint_legacy_relaxation
-                                else self.joint_linear_relaxation,
-                                self._DRIVE_MODES[self.joint_drive_mode],
-                                model.joint_effort_limit,
-                                self._joint_drive_impulse,
+                                body_deltas,
+                                control,
+                                joint_impulse,
                                 dt,
-                            ],
-                            outputs=[body_deltas, joint_impulse],
-                            device=model.device,
-                        )
-
-                        if self._has_joint_mimics:
-                            wp.launch(
-                                kernel=solve_joint_mimics,
-                                dim=model.joint_count,
-                                inputs=[
-                                    body_q,
-                                    model.body_com,
-                                    self.body_inv_mass_effective,
-                                    self.body_inv_inertia_effective,
-                                    model.joint_type,
-                                    model.joint_enabled,
-                                    model.joint_parent,
-                                    model.joint_child,
-                                    model.joint_X_p,
-                                    model.joint_X_c,
-                                    model.joint_qd_start,
-                                    model.joint_dof_dim,
-                                    model.joint_axis,
-                                    model.joint_mimic_joint,
-                                    model.joint_mimic_coeffs,
-                                    self.joint_angular_relaxation,
-                                    self.joint_linear_relaxation,
-                                    dt,
-                                ],
-                                outputs=[body_deltas, joint_impulse],
-                                device=model.device,
+                                color,
                             )
 
-                        body_q, body_qd = self._apply_body_deltas(model, state_in, state_out, body_deltas, dt)
+            # joint-only passes after the main iterations (joint_extra_iterations)
+            if model.body_count and model.joint_count:
+                for _ in range(self.joint_extra_iterations):
+                    for color in self._joint_color_passes:
+                        body_q, body_qd, body_deltas = self._solve_joints(
+                            model, state_in, state_out, body_q, body_qd, body_deltas, control, joint_impulse, dt, color
+                        )
 
             self._contact_impulse = contact_impulse
+            if self._body_contact_impulse is not None:
+                wp.launch(
+                    kernel=scale_spatial_vectors,
+                    dim=model.body_count,
+                    inputs=[self._body_contact_impulse, 1.0 / dt],
+                    outputs=[self._body_contact_force],
+                    device=model.device,
+                )
             self._contact_impulse_capacity = contacts.rigid_contact_max if contacts is not None else 0
             self._last_dt = dt
 
@@ -1270,6 +1290,98 @@ class SolverXPBD(SolverBase, CouplingInterface):
 
             if model.body_count:
                 self.copy_kinematic_body_state(model, state_in, state_out)
+
+    def _solve_joints(
+        self, model, state_in, state_out, body_q, body_qd, body_deltas, control, joint_impulse, dt, color
+    ):
+        """One joint pass: all joints (``color`` -1) or the joints of one color (``joint_coloring``), then apply."""
+        requires_grad = state_in.requires_grad
+        if requires_grad:
+            body_deltas = wp.zeros_like(body_deltas)
+        else:
+            body_deltas.zero_()
+
+        wp.launch(
+            kernel=solve_body_joints,
+            dim=model.joint_count,
+            inputs=[
+                body_q,
+                body_qd,
+                model.body_com,
+                self.body_inv_mass_effective,
+                self.body_inv_inertia_effective,
+                model.joint_type,
+                model.joint_enabled,
+                model.joint_parent,
+                model.joint_child,
+                model.joint_X_p,
+                model.joint_X_c,
+                model.joint_limit_lower,
+                model.joint_limit_upper,
+                model.joint_qd_start,
+                model.joint_target_q_start,
+                model.joint_dof_dim,
+                model.joint_axis,
+                control.joint_target_q,
+                control.joint_target_qd,
+                model.joint_target_ke,
+                model.joint_target_kd,
+                self.joint_linear_compliance,
+                self.joint_angular_compliance,
+                self.joint_angular_relaxation,
+                self.joint_linear_relaxation,
+                self.joint_angular_relaxation if self.joint_legacy_relaxation else self.joint_linear_relaxation,
+                self._DRIVE_MODES[self.joint_drive_mode],
+                model.joint_effort_limit,
+                self._joint_drive_impulse,
+                self._joint_color,
+                color,
+                dt,
+            ],
+            outputs=[body_deltas, joint_impulse],
+            device=model.device,
+        )
+
+        if self._has_joint_mimics and color == self._joint_color_passes[-1]:
+            wp.launch(
+                kernel=solve_joint_mimics,
+                dim=model.joint_count,
+                inputs=[
+                    body_q,
+                    model.body_com,
+                    self.body_inv_mass_effective,
+                    self.body_inv_inertia_effective,
+                    model.joint_type,
+                    model.joint_enabled,
+                    model.joint_parent,
+                    model.joint_child,
+                    model.joint_X_p,
+                    model.joint_X_c,
+                    model.joint_qd_start,
+                    model.joint_dof_dim,
+                    model.joint_axis,
+                    model.joint_mimic_joint,
+                    model.joint_mimic_coeffs,
+                    self.joint_angular_relaxation,
+                    self.joint_linear_relaxation,
+                    dt,
+                ],
+                outputs=[body_deltas, joint_impulse],
+                device=model.device,
+            )
+
+        body_q, body_qd = self._apply_body_deltas(model, state_in, state_out, body_deltas, dt)
+        return body_q, body_qd, body_deltas
+
+    @property
+    def body_contact_force(self) -> wp.array | None:
+        """Net rigid-contact force on each body during the last :meth:`step` [N], world frame, shape
+        ``(body_count,)`` of ``spatial_vector``: the top part is the total force (normal and friction), the bottom
+        part the normal forces only. Exact in the sense that it is the momentum the contact corrections of that
+        step gave the body, divided by ``dt`` (including the per-body contact weighting that
+        :meth:`update_contacts` can only approximate for contacts between two dynamic bodies). Restitution
+        impulses are not included. ``None`` unless the solver was created with ``body_contact_forces=True``."""
+        return self._body_contact_force
 
     @override
     def update_contacts(self, contacts: Contacts, state: State | None = None) -> None:

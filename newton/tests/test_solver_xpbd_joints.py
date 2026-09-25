@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """Articulated-dynamics accuracy tests for SolverXPBD joints: hinge angles beyond +-pi, joint relaxation, drives,
-effort limits and armature."""
+effort limits and armature; per-body contact forces."""
 
 import unittest
 
@@ -243,6 +243,33 @@ def test_joint_armature_inertia(test, device):
         test.assertAlmostEqual(accel * (_hinge_inertia(model) + extra), 1.0, delta=0.01, msg=mode)
 
 
+def test_body_contact_force_is_exact_on_a_stack(test, device):
+    """body_contact_force: the net contact force on each box of a resting two-box stack equals its weight (the
+    per-contact forces of update_contacts can only approximate the weighting of a contact between two bodies)."""
+    builder = newton.ModelBuilder()
+    builder.add_ground_plane()
+    b1 = builder.add_body(xform=wp.transform((0.0, 0.0, 0.1), wp.quat_identity()))
+    builder.add_shape_box(b1, hx=0.2, hy=0.2, hz=0.1)
+    b2 = builder.add_body(xform=wp.transform((0.05, 0.0, 0.25), wp.quat_identity()))
+    builder.add_shape_box(b2, hx=0.1, hy=0.1, hz=0.05, cfg=newton.ModelBuilder.ShapeConfig(density=3000.0))
+    model = builder.finalize(device=device)
+    solver = newton.solvers.SolverXPBD(model, iterations=4, body_contact_forces=True)
+    s0, s1, control = model.state(), model.state(), model.control()
+    pipeline = newton.CollisionPipeline(model)
+    contacts = pipeline.contacts()
+    for _ in range(1500):
+        s0.clear_forces()
+        pipeline.collide(s0, contacts)
+        solver.step(s0, s1, control, contacts, 1.0e-3)
+        s0, s1 = s1, s0
+    force = solver.body_contact_force.numpy()
+    weight = model.body_mass.numpy() * 9.81
+    for b in (b1, b2):
+        np.testing.assert_allclose(force[b][:3], (0.0, 0.0, weight[b]), rtol=0.005, atol=0.05 * weight[b] * 0.01)
+        np.testing.assert_allclose(force[b][3:], (0.0, 0.0, weight[b]), rtol=0.005, atol=0.05 * weight[b] * 0.01)
+    test.assertIsNone(newton.solvers.SolverXPBD(model).body_contact_force)
+
+
 devices = get_test_devices()
 
 
@@ -318,6 +345,13 @@ add_function_test(
     TestSolverXPBDJoints,
     "test_joint_armature_inertia",
     test_joint_armature_inertia,
+    devices=devices,
+    check_output=False,
+)
+add_function_test(
+    TestSolverXPBDJoints,
+    "test_body_contact_force_is_exact_on_a_stack",
+    test_body_contact_force_is_exact_on_a_stack,
     devices=devices,
     check_output=False,
 )

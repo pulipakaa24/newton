@@ -1814,6 +1814,8 @@ def solve_body_joints(
     drive_mode: int,
     joint_effort_limit: wp.array[float],
     drive_impulse: wp.array[wp.spatial_vector],
+    joint_color: wp.array[wp.int32],
+    color: int,
     dt: float,
     deltas: wp.array[wp.spatial_vector],
     joint_impulse: wp.array[wp.spatial_vector],
@@ -1828,6 +1830,9 @@ def solve_body_joints(
     tid = wp.tid()
     type = joint_type[tid]
 
+    if color >= 0:
+        if joint_color[tid] != color:
+            return
     if not joint_enabled[tid]:
         return
     if type == JointType.FREE:
@@ -2924,7 +2929,10 @@ def solve_body_contact_positions(
     deltas: wp.array[wp.spatial_vector],
     contact_inv_weight: wp.array[float],
     contact_impulse: wp.array[wp.spatial_vector],
+    body_contact_impulse: wp.array[wp.spatial_vector],
 ):
+    # body_contact_impulse (optional): per body, this iteration's raw contact impulses on the body (top: normal +
+    # friction linear impulse, bottom: normal part only), before the 1 / N contact weighting of apply_body_deltas
     tid = wp.tid()
 
     count = contact_count[0]
@@ -3132,6 +3140,11 @@ def solve_body_contact_positions(
 
     if contact_impulse:
         wp.atomic_add(contact_impulse, tid, wp.spatial_vector(lin_delta_a, ang_delta_a))
+    if body_contact_impulse:
+        if body_a >= 0:
+            wp.atomic_add(body_contact_impulse, body_a, wp.spatial_vector(lin_delta_a, -n * lambda_n))
+        if body_b >= 0:
+            wp.atomic_add(body_contact_impulse, body_b, wp.spatial_vector(lin_delta_b, n * lambda_n))
 
 
 @wp.kernel
@@ -3194,6 +3207,32 @@ def accumulate_weighted_contact_impulse(
         wp.spatial_bottom(impulse) * weight,
     )
     wp.atomic_add(contact_impulse, tid, scaled)
+
+
+@wp.kernel
+def accumulate_body_contact_impulse(
+    body_contact_impulse_iter: wp.array[wp.spatial_vector],
+    constraint_inv_weight: wp.array[float],
+    # outputs
+    body_contact_impulse: wp.array[wp.spatial_vector],
+):
+    """Add one iteration's contact impulses of each body with the weight ``apply_body_deltas`` applied to them
+    (``1 / N`` for N active contacts on the body), so the sum over the iterations is exactly the momentum the
+    contacts gave the body; clears the per-iteration buffer."""
+    b = wp.tid()
+    weight = 1.0
+    if constraint_inv_weight:
+        inv_weight = constraint_inv_weight[b]
+        if inv_weight > 0.0:
+            weight = 1.0 / inv_weight
+    wp.atomic_add(body_contact_impulse, b, body_contact_impulse_iter[b] * weight)
+    body_contact_impulse_iter[b] = wp.spatial_vector()
+
+
+@wp.kernel
+def scale_spatial_vectors(src: wp.array[wp.spatial_vector], scale: float, dst: wp.array[wp.spatial_vector]):
+    tid = wp.tid()
+    dst[tid] = src[tid] * scale
 
 
 @wp.kernel
