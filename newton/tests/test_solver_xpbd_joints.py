@@ -321,6 +321,8 @@ def test_joint_drive_gains_set_after_construction(test, device):
         q, _ = _run(model, solver, 800, 2.5e-3)
         tau_g = float(model.body_mass.numpy()[0]) * 9.81 * float(model.body_com.numpy()[0][0]) * np.cos(q)
         test.assertAlmostEqual(tau_g / (q - 0.5) / 200.0, 1.0, delta=0.01, msg=f"explicit {explicit}")
+        # the reported drive torque balances gravity at rest
+        test.assertAlmostEqual(float(solver.joint_drive_force.numpy()[0]) / -tau_g, 1.0, delta=0.01)
 
 
 devices = get_test_devices()

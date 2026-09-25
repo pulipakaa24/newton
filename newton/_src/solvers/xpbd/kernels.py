@@ -1788,6 +1788,7 @@ def compute_joint_drive_warmstart(
     drive_impulse: wp.array[wp.spatial_vector],
     drive_base: wp.array[wp.spatial_vector],
     drive_offset: wp.array[wp.spatial_vector],
+    drive_force: wp.array[float],
 ):
     """Spring part of the joint drives from the state at the start of the step, per drive DOF (slots: linear DOFs
     0..2, the rotational DOF of a joint with one rotational DOF 3; D6 joints with several rotational DOFs keep
@@ -1817,6 +1818,8 @@ def compute_joint_drive_warmstart(
     for k in range(n):
         if joint_target_ke[qd_start + k] > 0.0:
             any_ke = True
+    for k in range(n):
+        drive_force[qd_start + k] = 0.0
     if not any_ke or not joint_enabled[tid]:
         drive_impulse[tid] = wp.spatial_vector()
         drive_base[tid] = wp.spatial_vector()
@@ -1866,6 +1869,7 @@ def compute_joint_drive_warmstart(
                 f_explicit = f / ((1.0 + joint_target_kd[idx] * dt * w) * (1.0 + x * x))
                 base[slot] = f_explicit * dt
                 offset[slot] = (f - f_explicit) * dt
+            drive_force[idx] = f_explicit
             if linear != 0:
                 f_c += a_w * f_explicit
                 f_p -= a_w * f_explicit
@@ -1919,6 +1923,7 @@ def solve_joint_drive_rows(
     drive_impulse: wp.array[wp.spatial_vector],
     deltas: wp.array[wp.spatial_vector],
     joint_impulse: wp.array[wp.spatial_vector],
+    drive_force: wp.array[float],
 ):
     """Drive rows (see :func:`joint_drive_delta_impulse`), one per drive DOF, Gauss-Seidel after the joint's hard rows
     of the same pass (``pending_p``/``pending_c``): their error and rate include the effect of those corrections
@@ -2021,6 +2026,7 @@ def solve_joint_drive_rows(
                     dt,
                 )
                 impulse_acc[slot] = impulse + d
+                drive_force[idx] = (base[slot] + impulse + d) / dt
                 if linear != 0:
                     d_lin_c += a_w * d
                     d_lin_p -= a_w * d

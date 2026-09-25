@@ -293,6 +293,7 @@ class SolverXPBD(SolverBase, CouplingInterface):
         self._joint_ref_err = None
         self._joint_drive_base = None
         self._joint_drive_offset = None
+        self._joint_drive_force = None
         if model.joint_count:
             with wp.ScopedDevice(model.device):
                 self._joint_drive_impulse = wp.zeros(model.joint_count, dtype=wp.spatial_vector)
@@ -302,8 +303,12 @@ class SolverXPBD(SolverBase, CouplingInterface):
                 self._joint_pending_c = wp.zeros(model.joint_count, dtype=wp.spatial_vector)
                 self._joint_drive_base = wp.zeros(model.joint_count, dtype=wp.spatial_vector)
                 self._joint_drive_offset = wp.zeros(model.joint_count, dtype=wp.spatial_vector)
+                self._joint_drive_force = wp.zeros(model.joint_dof_count, dtype=float)
             self._refresh_joint_references()
             self._refresh_drive_joints()
+        # compatibility: earlier revisions of this fork exposed the drive force buffer as _joint_drive_f, which callers
+        # (MetalSim's NewtonSim) probe to detect the fork; test ``hasattr(solver, "joint_drive_mode")`` instead
+        self._joint_drive_f = self._joint_drive_force
 
         self.rigid_contact_relaxation = rigid_contact_relaxation
         if rigid_contact_restitution_iterations < 1:
@@ -839,6 +844,7 @@ class SolverXPBD(SolverBase, CouplingInterface):
                                 self._joint_drive_impulse,
                                 self._joint_drive_base,
                                 self._joint_drive_offset,
+                                self._joint_drive_force,
                             ],
                             device=model.device,
                         )
@@ -1459,7 +1465,7 @@ class SolverXPBD(SolverBase, CouplingInterface):
                     self._drive_joints,
                     dt,
                 ],
-                outputs=[self._joint_drive_impulse, body_deltas, joint_impulse],
+                outputs=[self._joint_drive_impulse, body_deltas, joint_impulse, self._joint_drive_force],
                 device=model.device,
             )
 
@@ -1493,6 +1499,13 @@ class SolverXPBD(SolverBase, CouplingInterface):
 
         body_q, body_qd = self._apply_body_deltas(model, state_in, state_out, body_deltas, dt)
         return body_q, body_qd, body_deltas
+
+    @property
+    def joint_drive_force(self) -> wp.array | None:
+        """Force [N] or torque [N·m] of each DOF's drive in the last :meth:`step` (``joint_drive_mode`` ``"pd"`` or
+        ``"implicit"``; zero for DOFs without a drive or outside the solver's drive list), shape
+        ``(joint_dof_count,)``. Like :attr:`~newton.Control.joint_f`, a generalized force on the DOF."""
+        return self._joint_drive_force
 
     @property
     def body_contact_force(self) -> wp.array | None:
