@@ -23,6 +23,7 @@ from .kernels import (
     apply_particle_deltas,
     apply_particle_shape_restitution,
     bending_constraint,
+    compute_joint_angle_references,
     compute_joint_drive_warmstart,
     convert_contact_impulse_to_force,
     convert_joint_impulse_to_parent_f,
@@ -31,6 +32,7 @@ from .kernels import (
     scale_spatial_vectors,
     solve_body_contact_positions,
     solve_body_joints,
+    solve_joint_drive_rows,
     solve_joint_mimics,
     solve_particle_particle_contacts,
     solve_particle_shape_contacts,
@@ -277,15 +279,22 @@ class SolverXPBD(SolverBase, CouplingInterface):
             self._body_inertia = wp.empty_like(model.body_inertia)
             self._body_inv_inertia = wp.empty_like(model.body_inv_inertia)
         self._joint_drive_impulse = None
-        self._joint_drive_f = None
+        self._joint_pending_p = None
+        self._joint_pending_c = None
+        self._joint_ref_rot = None
+        self._joint_ref_err = None
         self._joint_drive_base = None
         self._joint_drive_offset = None
         if model.joint_count:
             with wp.ScopedDevice(model.device):
                 self._joint_drive_impulse = wp.zeros(model.joint_count, dtype=wp.spatial_vector)
-                self._joint_drive_f = wp.zeros(model.joint_dof_count, dtype=float)
+                self._joint_pending_p = wp.zeros(model.joint_count, dtype=wp.spatial_vector)
+                self._joint_ref_rot = wp.zeros(model.joint_count, dtype=wp.quat)
+                self._joint_ref_err = wp.zeros(model.joint_count, dtype=wp.vec3)
+                self._joint_pending_c = wp.zeros(model.joint_count, dtype=wp.spatial_vector)
                 self._joint_drive_base = wp.zeros(model.joint_count, dtype=wp.spatial_vector)
                 self._joint_drive_offset = wp.zeros(model.joint_count, dtype=wp.spatial_vector)
+            self._refresh_joint_references()
 
         self.rigid_contact_relaxation = rigid_contact_relaxation
         if rigid_contact_restitution_iterations < 1:
@@ -348,10 +357,30 @@ class SolverXPBD(SolverBase, CouplingInterface):
         if flags & (ModelFlags.BODY_PROPERTIES | ModelFlags.BODY_INERTIAL_PROPERTIES):
             self._refresh_kinematic_state()
         if flags & (ModelFlags.JOINT_DOF_PROPERTIES | ModelFlags.JOINT_PROPERTIES):
+            self._refresh_joint_references()
             if self.joint_armature_inertia != "none":
                 self._refresh_kinematic_state()
         if self.enable_restitution and flags & ModelFlags.SHAPE_PROPERTIES:
             self._refresh_rigid_restitution_enabled()
+
+    def _refresh_joint_references(self):
+        """Angle references of the joints with one rotational DOF (static part), from the joint limits."""
+        model = self.model
+        if model.joint_count:
+            wp.launch(
+                kernel=compute_joint_angle_references,
+                dim=model.joint_count,
+                inputs=[
+                    model.joint_type,
+                    model.joint_qd_start,
+                    model.joint_dof_dim,
+                    model.joint_axis,
+                    model.joint_limit_lower,
+                    model.joint_limit_upper,
+                ],
+                outputs=[self._joint_ref_rot, self._joint_ref_err],
+                device=model.device,
+            )
 
     @staticmethod
     def _color_joints(model: Model) -> np.ndarray:
@@ -742,6 +771,10 @@ class SolverXPBD(SolverBase, CouplingInterface):
                             dim=model.joint_count,
                             inputs=[
                                 state_in.body_q,
+                                state_in.body_qd,
+                                model.body_com,
+                                self.body_inv_mass_effective,
+                                self.body_inv_inertia_effective,
                                 model.joint_type,
                                 model.joint_enabled,
                                 model.joint_parent,
@@ -756,43 +789,18 @@ class SolverXPBD(SolverBase, CouplingInterface):
                                 model.joint_limit_upper,
                                 control.joint_target_q,
                                 model.joint_target_ke,
-                                model.joint_effort_limit,
-                                self.body_inv_inertia_effective,
-                                self.body_inv_mass_effective,
-                                state_in.body_qd,
-                                model.body_com,
-                                control.joint_target_qd,
                                 model.joint_target_kd,
+                                model.joint_effort_limit,
                                 self._DRIVE_MODES[self.joint_drive_mode],
                                 dt,
                             ],
                             outputs=[
-                                self._joint_drive_f,
+                                body_f_tmp,
+                                joint_impulse,
                                 self._joint_drive_impulse,
                                 self._joint_drive_base,
                                 self._joint_drive_offset,
                             ],
-                            device=model.device,
-                        )
-                        wp.launch(
-                            kernel=apply_joint_forces,
-                            dim=model.joint_count,
-                            inputs=[
-                                state_in.body_q,
-                                model.body_com,
-                                model.joint_type,
-                                model.joint_enabled,
-                                model.joint_parent,
-                                model.joint_child,
-                                model.joint_X_p,
-                                model.joint_X_c,
-                                model.joint_qd_start,
-                                model.joint_dof_dim,
-                                model.joint_axis,
-                                self._joint_drive_f,
-                                dt,
-                            ],
-                            outputs=[body_f_tmp, joint_impulse],
                             device=model.device,
                         )
 
@@ -1366,18 +1374,55 @@ class SolverXPBD(SolverBase, CouplingInterface):
                 self.joint_linear_relaxation,
                 self.joint_angular_relaxation if self.joint_legacy_relaxation else self.joint_linear_relaxation,
                 self._DRIVE_MODES[self.joint_drive_mode],
-                model.joint_effort_limit,
-                self._joint_drive_impulse,
-                self._joint_drive_base,
-                self._joint_drive_offset,
-                self.joint_drive_relaxation,
+                self._joint_ref_rot,
+                self._joint_ref_err,
                 self._joint_color,
                 color,
                 dt,
             ],
-            outputs=[body_deltas, joint_impulse],
+            outputs=[body_deltas, joint_impulse, self._joint_pending_p, self._joint_pending_c],
             device=model.device,
         )
+        if self.joint_drive_mode != "compliance":
+            wp.launch(
+                kernel=solve_joint_drive_rows,
+                dim=model.joint_count,
+                inputs=[
+                    body_q,
+                    body_qd,
+                    model.body_com,
+                    self.body_inv_mass_effective,
+                    self.body_inv_inertia_effective,
+                    model.joint_type,
+                    model.joint_enabled,
+                    model.joint_parent,
+                    model.joint_child,
+                    model.joint_X_p,
+                    model.joint_X_c,
+                    model.joint_qd_start,
+                    model.joint_target_q_start,
+                    model.joint_dof_dim,
+                    model.joint_axis,
+                    model.joint_limit_lower,
+                    model.joint_limit_upper,
+                    control.joint_target_q,
+                    control.joint_target_qd,
+                    model.joint_target_ke,
+                    model.joint_target_kd,
+                    model.joint_effort_limit,
+                    self._DRIVE_MODES[self.joint_drive_mode],
+                    self.joint_drive_relaxation,
+                    self._joint_drive_base,
+                    self._joint_drive_offset,
+                    self._joint_pending_p,
+                    self._joint_pending_c,
+                    self._joint_color,
+                    color,
+                    dt,
+                ],
+                outputs=[self._joint_drive_impulse, body_deltas, joint_impulse],
+                device=model.device,
+            )
 
         if self._has_joint_mimics and color == self._joint_color_passes[-1]:
             wp.launch(
