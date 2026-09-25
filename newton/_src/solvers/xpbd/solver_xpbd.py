@@ -281,7 +281,9 @@ class SolverXPBD(SolverBase, CouplingInterface):
         self._joint_drive_impulse = None
         self._joint_pending_p = None
         self._joint_pending_c = None
-        self._joint_ref_rot = None
+        self._joint_X_c_solve = None
+        self._drive_joints = None
+        self._drive_joint_count = 0
         self._joint_ref_err = None
         self._joint_drive_base = None
         self._joint_drive_offset = None
@@ -289,12 +291,13 @@ class SolverXPBD(SolverBase, CouplingInterface):
             with wp.ScopedDevice(model.device):
                 self._joint_drive_impulse = wp.zeros(model.joint_count, dtype=wp.spatial_vector)
                 self._joint_pending_p = wp.zeros(model.joint_count, dtype=wp.spatial_vector)
-                self._joint_ref_rot = wp.zeros(model.joint_count, dtype=wp.quat)
+                self._joint_X_c_solve = wp.clone(model.joint_X_c)
                 self._joint_ref_err = wp.zeros(model.joint_count, dtype=wp.vec3)
                 self._joint_pending_c = wp.zeros(model.joint_count, dtype=wp.spatial_vector)
                 self._joint_drive_base = wp.zeros(model.joint_count, dtype=wp.spatial_vector)
                 self._joint_drive_offset = wp.zeros(model.joint_count, dtype=wp.spatial_vector)
             self._refresh_joint_references()
+            self._refresh_drive_joints()
 
         self.rigid_contact_relaxation = rigid_contact_relaxation
         if rigid_contact_restitution_iterations < 1:
@@ -358,10 +361,35 @@ class SolverXPBD(SolverBase, CouplingInterface):
             self._refresh_kinematic_state()
         if flags & (ModelFlags.JOINT_DOF_PROPERTIES | ModelFlags.JOINT_PROPERTIES):
             self._refresh_joint_references()
+            self._refresh_drive_joints()
             if self.joint_armature_inertia != "none":
                 self._refresh_kinematic_state()
         if self.enable_restitution and flags & ModelFlags.SHAPE_PROPERTIES:
             self._refresh_rigid_restitution_enabled()
+
+    def _refresh_drive_joints(self):
+        """Joints with a position or velocity drive (``joint_target_ke``/``kd`` > 0) on a linear DOF or on the single
+        rotational DOF: the drive kernels run over these only. Read from the model at construction and by
+        :meth:`notify_model_changed` (``JOINT_DOF_PROPERTIES``): gains set on the model afterwards take effect after
+        that call (until then such drives act as the ``"compliance"`` rows)."""
+        model = self.model
+        if not model.joint_count:
+            return
+        ke = model.joint_target_ke.numpy()
+        kd = model.joint_target_kd.numpy()
+        qd_start = model.joint_qd_start.numpy()
+        dof_dim = model.joint_dof_dim.numpy()
+        jtype = model.joint_type.numpy()
+        ids = []
+        for j in range(model.joint_count):
+            if jtype[j] not in (JointType.REVOLUTE, JointType.PRISMATIC, JointType.D6):
+                continue
+            n = int(dof_dim[j, 0]) + (1 if int(dof_dim[j, 1]) == 1 else 0)
+            d = int(qd_start[j])
+            if np.any(ke[d : d + n] > 0.0) or np.any(kd[d : d + n] > 0.0):
+                ids.append(j)
+        self._drive_joint_count = len(ids)
+        self._drive_joints = wp.array(np.array(ids or [0], dtype=np.int32), dtype=int, device=model.device)
 
     def _refresh_joint_references(self):
         """Angle references of the joints with one rotational DOF (static part), from the joint limits."""
@@ -372,13 +400,14 @@ class SolverXPBD(SolverBase, CouplingInterface):
                 dim=model.joint_count,
                 inputs=[
                     model.joint_type,
+                    model.joint_X_c,
                     model.joint_qd_start,
                     model.joint_dof_dim,
                     model.joint_axis,
                     model.joint_limit_lower,
                     model.joint_limit_upper,
                 ],
-                outputs=[self._joint_ref_rot, self._joint_ref_err],
+                outputs=[self._joint_X_c_solve, self._joint_ref_err],
                 device=model.device,
             )
 
@@ -765,10 +794,10 @@ class SolverXPBD(SolverBase, CouplingInterface):
                         outputs=[body_f_tmp, joint_impulse],
                         device=model.device,
                     )
-                    if self.joint_drive_mode != "compliance":
+                    if self.joint_drive_mode != "compliance" and self._drive_joint_count:
                         wp.launch(
                             kernel=compute_joint_drive_warmstart,
-                            dim=model.joint_count,
+                            dim=self._drive_joint_count,
                             inputs=[
                                 state_in.body_q,
                                 state_in.body_qd,
@@ -792,6 +821,7 @@ class SolverXPBD(SolverBase, CouplingInterface):
                                 model.joint_target_kd,
                                 model.joint_effort_limit,
                                 self._DRIVE_MODES[self.joint_drive_mode],
+                                self._drive_joints,
                                 dt,
                             ],
                             outputs=[
@@ -1357,7 +1387,7 @@ class SolverXPBD(SolverBase, CouplingInterface):
                 model.joint_parent,
                 model.joint_child,
                 model.joint_X_p,
-                model.joint_X_c,
+                self._joint_X_c_solve,
                 model.joint_limit_lower,
                 model.joint_limit_upper,
                 model.joint_qd_start,
@@ -1373,8 +1403,7 @@ class SolverXPBD(SolverBase, CouplingInterface):
                 self.joint_angular_relaxation,
                 self.joint_linear_relaxation,
                 self.joint_angular_relaxation if self.joint_legacy_relaxation else self.joint_linear_relaxation,
-                self._DRIVE_MODES[self.joint_drive_mode],
-                self._joint_ref_rot,
+                self._DRIVE_MODES[self.joint_drive_mode] if self._drive_joint_count else 0,
                 self._joint_ref_err,
                 self._joint_color,
                 color,
@@ -1383,10 +1412,10 @@ class SolverXPBD(SolverBase, CouplingInterface):
             outputs=[body_deltas, joint_impulse, self._joint_pending_p, self._joint_pending_c],
             device=model.device,
         )
-        if self.joint_drive_mode != "compliance":
+        if self.joint_drive_mode != "compliance" and self._drive_joint_count:
             wp.launch(
                 kernel=solve_joint_drive_rows,
-                dim=model.joint_count,
+                dim=self._drive_joint_count,
                 inputs=[
                     body_q,
                     body_qd,
@@ -1418,6 +1447,7 @@ class SolverXPBD(SolverBase, CouplingInterface):
                     self._joint_pending_c,
                     self._joint_color,
                     color,
+                    self._drive_joints,
                     dt,
                 ],
                 outputs=[self._joint_drive_impulse, body_deltas, joint_impulse],

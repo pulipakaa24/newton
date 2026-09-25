@@ -1725,19 +1725,21 @@ def joint_drive_ref(lower: float, upper: float, target: float) -> float:
 @wp.kernel
 def compute_joint_angle_references(
     joint_type: wp.array[int],
+    joint_X_c: wp.array[wp.transform],
     joint_qd_start: wp.array[int],
     joint_dof_dim: wp.array2d[int],
     joint_axis: wp.array[wp.vec3],
     joint_limit_lower: wp.array[float],
     joint_limit_upper: wp.array[float],
     # outputs
-    joint_ref_rot: wp.array[wp.quat],
+    joint_X_c_solve: wp.array[wp.transform],
     joint_ref_err: wp.array[wp.vec3],
 ):
-    """Per joint with one rotational DOF: rotation by -reference about the axis and the reference as an error vector
-    (see solve_body_joints); NaN error for an unlimited joint (reference = drive target, evaluated per step)."""
+    """Per joint with one rotational DOF: the child joint frame rotated by -reference about the axis (used by
+    solve_body_joints in place of ``joint_X_c``) and the reference as an error vector; NaN error for an unlimited
+    joint (reference = drive target, evaluated per step)."""
     tid = wp.tid()
-    joint_ref_rot[tid] = wp.quat_identity()
+    joint_X_c_solve[tid] = joint_X_c[tid]
     joint_ref_err[tid] = wp.vec3(0.0)
     if joint_dof_dim[tid, 1] != 1 or joint_type[tid] == JointType.BALL:
         return
@@ -1747,7 +1749,7 @@ def compute_joint_angle_references(
     if upper >= lower and upper - lower < 2.0 * wp.pi:
         ref = joint_angle_reference(lower, upper)
         a = wp.normalize(joint_axis[idx])
-        joint_ref_rot[tid] = wp.quat_from_axis_angle(a, -ref)
+        joint_X_c_solve[tid] = joint_X_c[tid] * wp.transform(wp.vec3(0.0), wp.quat_from_axis_angle(a, -ref))
         joint_ref_err[tid] = a * ref
     else:
         nan = wp.nan
@@ -1778,6 +1780,7 @@ def compute_joint_drive_warmstart(
     joint_target_kd: wp.array[float],
     joint_effort_limit: wp.array[float],
     drive_mode: int,
+    drive_joints: wp.array[int],
     dt: float,
     # outputs
     body_f: wp.array[wp.spatial_vector],
@@ -1800,7 +1803,7 @@ def compute_joint_drive_warmstart(
     link (kd dt w >> 1, e.g. fingers) a velocity kick that the coupled damper rows cannot remove within a few
     iterations; a spring entirely in the row biases the statics of heavy links, which the row sees mid-iteration;
     the 1 / (1 + x^2) factor keeps the explicit part stable when x is of order 1 or more (light links)."""
-    tid = wp.tid()
+    tid = drive_joints[wp.tid()]
     type = joint_type[tid]
     if type != JointType.REVOLUTE and type != JointType.PRISMATIC and type != JointType.D6:
         return
@@ -1910,6 +1913,7 @@ def solve_joint_drive_rows(
     pending_c: wp.array[wp.spatial_vector],
     joint_color: wp.array[wp.int32],
     color: int,
+    drive_joints: wp.array[int],
     dt: float,
     # in/out
     drive_impulse: wp.array[wp.spatial_vector],
@@ -1921,7 +1925,7 @@ def solve_joint_drive_rows(
     (otherwise a drive would, e.g., damp the rotation about the child COM that the anchor rows turn into a rotation
     about the pivot in the same pass, and settle with a biased force). Kept out of solve_body_joints so that kernel
     stays as light as without drives."""
-    tid = wp.tid()
+    tid = drive_joints[wp.tid()]
     if color >= 0:
         if joint_color[tid] != color:
             return
@@ -2059,7 +2063,6 @@ def solve_body_joints(
     linear_relaxation: float,
     linear_row_angular_relaxation: float,
     drive_mode: int,
-    joint_ref_rot: wp.array[wp.quat],
     joint_ref_err: wp.array[wp.vec3],
     joint_color: wp.array[wp.int32],
     color: int,
@@ -2401,15 +2404,14 @@ def solve_body_joints(
         # -reference about the axis, decompose, and add the reference back. Without this, a hinge whose range
         # extends beyond +-pi (or that overshoots a limit near pi) reads an angle ~2 pi away from the true one and
         # receives a "limit correction" of that size.
-        # (static references of limited joints precomputed per joint: joint_ref_rot, joint_ref_err; a flag < 0 marks
-        # an unlimited joint whose reference is its drive target)
+        # (static references of limited joints are baked into joint_X_c, the child frame this kernel receives, and
+        # joint_ref_err; a NaN marks an unlimited joint whose reference is its drive target)
         ang_ref = wp.vec3(0.0)
         if ang_axis_count == 1:
             ref_err = joint_ref_err[tid]
-            if ref_err[0] == ref_err[0] and wp.length_sq(ref_err) > 0.0:  # not NaN: static reference
-                q_c = q_c * joint_ref_rot[tid]
+            if ref_err[0] == ref_err[0]:  # not NaN: static reference, already in X_c
                 ang_ref = ref_err
-            elif ref_err[0] != ref_err[0]:
+            else:
                 ref_idx = axis_start + lin_axis_count
                 if joint_target_ke[ref_idx] > 0.0:
                     ref = joint_target_q[target_axis_start + lin_axis_count]
