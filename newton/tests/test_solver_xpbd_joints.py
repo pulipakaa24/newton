@@ -1,7 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""Articulated-dynamics accuracy tests for SolverXPBD joints: hinge angles beyond +-pi."""
+"""Articulated-dynamics accuracy tests for SolverXPBD joints: hinge angles beyond +-pi, joint relaxation, drives,
+effort limits and armature."""
 
 import unittest
 
@@ -35,9 +36,10 @@ def _hinge_link(device, limit_lower, limit_upper, q0=0.0, qd0=0.0, gravity=0.0, 
 
 
 def _hinge_inertia(model):
-    return float(model.body_inertia.numpy()[0][1, 1]) + float(model.body_mass.numpy()[0]) * float(
-        model.body_com.numpy()[0][0]
-    ) ** 2
+    return (
+        float(model.body_inertia.numpy()[0][1, 1])
+        + float(model.body_mass.numpy()[0]) * float(model.body_com.numpy()[0][0]) ** 2
+    )
 
 
 def test_revolute_limit_beyond_pi_does_not_gain_energy(test, device):
@@ -111,6 +113,136 @@ def test_revolute_unlimited_drive_takes_short_way(test, device):
     test.assertLess(abs(err), 0.05)
 
 
+def _pendulum_response(device, gravity, torque, **solver_kw):
+    """Angular acceleration of a 6 kg hinged box (COM 0.25 m from the pivot) over 20 steps of 2.5 ms from rest,
+    divided by the analytic value; N semi-implicit steps from rest give q_N = a dt^2 N (N + 1) / 2 exactly."""
+    builder = newton.ModelBuilder(gravity=gravity)
+    link = builder.add_link(xform=wp.transform((0.0, 0.0, 1.0), wp.quat_identity()), mass=1.0)
+    builder.add_shape_box(link, xform=wp.transform((0.25, 0.0, 0.0), wp.quat_identity()), hx=0.25, hy=0.05, hz=0.05)
+    joint = builder.add_joint_revolute(
+        -1, link, parent_xform=wp.transform((0.0, 0.0, 1.0), wp.quat_identity()), axis=(0.0, 1.0, 0.0)
+    )
+    builder.add_articulation([joint])
+    model = builder.finalize(device=device)
+    solver = newton.solvers.SolverXPBD(model, **solver_kw)
+    s0, s1, control = model.state(), model.state(), model.control()
+    control.joint_f.assign(np.array([torque], dtype=np.float32))
+    dt, n = 2.5e-3, 20
+    for _ in range(n):
+        s0.clear_forces()
+        solver.step(s0, s1, control, None, dt)
+        s0, s1 = s1, s0
+    q = wp.zeros(1, dtype=float, device=device)
+    qd = wp.zeros(1, dtype=float, device=device)
+    newton.eval_ik(model, s0, q, qd)
+    accel = 2.0 * float(q.numpy()[0]) / (dt * dt * n * (n + 1))
+    inertia = _hinge_inertia(model)
+    mass, r = float(model.body_mass.numpy()[0]), float(model.body_com.numpy()[0][0])
+    analytic = torque / inertia if torque != 0.0 else mass * 9.81 * r / inertia
+    return accel / analytic
+
+
+def test_joint_relaxation_transmits_torque_and_gravity(test, device):
+    """A pendulum responds to a joint torque and to gravity as the analytic hinge, at the default and at unequal
+    relaxation factors (each row applies one consistent impulse)."""
+    for kw in ({}, {"joint_linear_relaxation": 0.7, "joint_angular_relaxation": 0.4, "iterations": 8}):
+        test.assertAlmostEqual(_pendulum_response(device, 0.0, 1.0, **kw), 1.0, delta=0.01)
+        test.assertAlmostEqual(_pendulum_response(device, -9.81, 0.0, **kw), 1.0, delta=0.01)
+
+
+def test_joint_legacy_relaxation_switch(test, device):
+    """joint_legacy_relaxation restores the former scaling (moment of a positional impulse by the angular factor)."""
+    kw = {"joint_linear_relaxation": 0.7, "joint_angular_relaxation": 0.4, "joint_legacy_relaxation": True}
+    test.assertGreater(_pendulum_response(device, 0.0, 1.0, **kw), 1.3)
+    test.assertLess(_pendulum_response(device, -9.81, 0.0, **kw), 0.85)
+
+
+def _pendulum_model(device, gravity=-9.81, ke=0.0, kd=0.0, target=0.0, effort=1e6, armature=0.0):
+    builder = newton.ModelBuilder(gravity=gravity)
+    link = builder.add_link(xform=wp.transform((0.0, 0.0, 1.0), wp.quat_identity()), mass=1.0)
+    builder.add_shape_box(link, xform=wp.transform((0.25, 0.0, 0.0), wp.quat_identity()), hx=0.25, hy=0.05, hz=0.05)
+    joint = builder.add_joint_revolute(
+        -1,
+        link,
+        parent_xform=wp.transform((0.0, 0.0, 1.0), wp.quat_identity()),
+        axis=(0.0, 1.0, 0.0),
+        target_ke=ke,
+        target_kd=kd,
+        target_pos=target,
+        effort_limit=effort,
+        armature=armature,
+    )
+    builder.add_articulation([joint])
+    return builder.finalize(device=device)
+
+
+def _run(model, solver, steps, dt, torque=0.0):
+    s0, s1, control = model.state(), model.state(), model.control()
+    newton.eval_fk(model, model.joint_q, model.joint_qd, s0)
+    control.joint_f.assign(np.array([torque], dtype=np.float32))
+    for _ in range(steps):
+        s0.clear_forces()
+        solver.step(s0, s1, control, None, dt)
+        s0, s1 = s1, s0
+    q = wp.zeros(1, dtype=float, device=model.device)
+    qd = wp.zeros(1, dtype=float, device=model.device)
+    newton.eval_ik(model, s0, q, qd)
+    return float(q.numpy()[0]), float(qd.numpy()[0])
+
+
+def test_joint_drive_stiffness_is_ke_at_any_iteration_count(test, device):
+    """A pendulum held by a position drive settles at the sag tau_gravity / ke for 1, 4 and 16 iterations."""
+    for mode, tol in (("pd", 0.01), ("implicit", 0.03)):
+        for iterations in (1, 4, 16):
+            if mode == "implicit" and iterations == 1:
+                continue  # the implicit rows converge with the iterations
+            model = _pendulum_model(device, ke=200.0, kd=5.0, target=0.5)
+            solver = newton.solvers.SolverXPBD(model, iterations=iterations, joint_drive_mode=mode)
+            q, _ = _run(model, solver, 800, 2.5e-3)
+            tau_g = float(model.body_mass.numpy()[0]) * 9.81 * float(model.body_com.numpy()[0][0]) * np.cos(q)
+            test.assertAlmostEqual(tau_g / (q - 0.5) / 200.0, 1.0, delta=tol, msg=f"{mode}, {iterations} iterations")
+
+
+def test_joint_drive_compliance_mode_is_legacy(test, device):
+    """joint_drive_mode="compliance" keeps the former drive, whose stiffness grows with the iteration count."""
+    stiffness = []
+    for iterations in (2, 8):
+        model = _pendulum_model(device, ke=200.0, kd=5.0, target=0.5)
+        solver = newton.solvers.SolverXPBD(
+            model,
+            iterations=iterations,
+            joint_drive_mode="compliance",
+            joint_linear_relaxation=0.4,
+            joint_angular_relaxation=0.4,
+        )
+        q, _ = _run(model, solver, 800, 2.5e-3)
+        tau_g = float(model.body_mass.numpy()[0]) * 9.81 * float(model.body_com.numpy()[0][0]) * np.cos(q)
+        stiffness.append(tau_g / (q - 0.5))
+    test.assertGreater(stiffness[1], 3.0 * stiffness[0])
+
+
+def test_joint_drive_effort_limit(test, device):
+    """The drive force is clamped at joint_effort_limit (zero gravity, target far away: q = f dt^2 N (N + 1) / 2 / I)."""
+    dt, n = 2.5e-3, 20
+    for mode in ("pd", "implicit"):
+        model = _pendulum_model(device, gravity=0.0, ke=1000.0, target=1.0, effort=2.0)
+        solver = newton.solvers.SolverXPBD(model, iterations=4, joint_drive_mode=mode)
+        q, _ = _run(model, solver, n, dt)
+        accel = 2.0 * q / (dt * dt * n * (n + 1))
+        test.assertAlmostEqual(accel * _hinge_inertia(model) / 2.0, 1.0, delta=0.03, msg=mode)
+
+
+def test_joint_armature_inertia(test, device):
+    """joint_armature adds rotor inertia about the axis with "isotropic" or "axis"; "none" (default) ignores it."""
+    dt, n, arm = 2.5e-3, 20, 0.2
+    for mode, extra in (("isotropic", arm), ("axis", arm), ("none", 0.0)):  # default "none"
+        model = _pendulum_model(device, gravity=0.0, armature=arm)
+        solver = newton.solvers.SolverXPBD(model, iterations=4, joint_armature_inertia=mode)
+        q, _ = _run(model, solver, n, dt, torque=1.0)
+        accel = 2.0 * q / (dt * dt * n * (n + 1))
+        test.assertAlmostEqual(accel * (_hinge_inertia(model) + extra), 1.0, delta=0.01, msg=mode)
+
+
 devices = get_test_devices()
 
 
@@ -143,6 +275,49 @@ add_function_test(
     TestSolverXPBDJoints,
     "test_revolute_unlimited_drive_takes_short_way",
     test_revolute_unlimited_drive_takes_short_way,
+    devices=devices,
+    check_output=False,
+)
+add_function_test(
+    TestSolverXPBDJoints,
+    "test_joint_relaxation_transmits_torque_and_gravity",
+    test_joint_relaxation_transmits_torque_and_gravity,
+    devices=devices,
+    check_output=False,
+)
+add_function_test(
+    TestSolverXPBDJoints,
+    "test_joint_legacy_relaxation_switch",
+    test_joint_legacy_relaxation_switch,
+    devices=devices,
+    check_output=False,
+)
+
+add_function_test(
+    TestSolverXPBDJoints,
+    "test_joint_drive_stiffness_is_ke_at_any_iteration_count",
+    test_joint_drive_stiffness_is_ke_at_any_iteration_count,
+    devices=devices,
+    check_output=False,
+)
+add_function_test(
+    TestSolverXPBDJoints,
+    "test_joint_drive_compliance_mode_is_legacy",
+    test_joint_drive_compliance_mode_is_legacy,
+    devices=devices,
+    check_output=False,
+)
+add_function_test(
+    TestSolverXPBDJoints,
+    "test_joint_drive_effort_limit",
+    test_joint_drive_effort_limit,
+    devices=devices,
+    check_output=False,
+)
+add_function_test(
+    TestSolverXPBDJoints,
+    "test_joint_armature_inertia",
+    test_joint_armature_inertia,
     devices=devices,
     check_output=False,
 )

@@ -13,7 +13,7 @@ from ...math import (
     velocity_at_point,
 )
 from ...sim import BodyFlags, JointType, Model
-from ...sim.articulation import joint_angle_reference
+from ...sim.articulation import joint_angle_reference, wrap_angle_near
 from ...sim.contacts import contact_surface_point, contact_surface_separation
 from ...sim.joint_mimic import eval_joint_mimic_coordinate
 
@@ -1555,6 +1555,234 @@ def solve_simple_body_joints(
         wp.atomic_add(deltas, id_c, wp.spatial_vector(lin_delta_c, ang_delta_c))
 
 
+@wp.func
+def joint_drive_delta_impulse(
+    impulse: float,
+    err: float,
+    derr: float,
+    inv_mass: float,
+    ke: float,
+    kd: float,
+    max_impulse: float,
+    relaxation: float,
+    dt: float,
+) -> float:
+    """Increment of a joint drive's accumulated impulse [N s or N m s] for one iteration.
+
+    The drive is the implicit (backward-Euler) PD law ``f = -ke * err - kd * derr`` of the state after the
+    correction, with ``err`` the position error and ``derr`` the rate error along the row and ``inv_mass`` the
+    row's inverse effective mass. Solving ``impulse + d = dt * f(err + inv_mass * dt * d, derr + inv_mass * d)``
+    for ``d`` gives the expression below; its fixed point ``impulse = -dt * (ke * err + kd * derr)`` does not depend
+    on the iteration count or on ``relaxation``, which only scales the step. The accumulated impulse is clamped to
+    ``+-max_impulse`` (effort limit times ``dt``).
+    """
+    d = -(impulse + dt * (ke * err + kd * derr)) / (1.0 + (dt * dt * ke + dt * kd) * inv_mass)
+    return wp.clamp(impulse + relaxation * d, -max_impulse, max_impulse) - impulse
+
+
+@wp.func
+def spatial_get(v: wp.spatial_vector, i: int) -> float:
+    return v[i]
+
+
+@wp.kernel
+def add_joint_armature_inertia(
+    joint_type: wp.array[int],
+    joint_child: wp.array[int],
+    joint_X_c: wp.array[wp.transform],
+    joint_qd_start: wp.array[int],
+    joint_dof_dim: wp.array2d[int],
+    joint_axis: wp.array[wp.vec3],
+    joint_armature: wp.array[float],
+    isotropic: int,
+    body_inertia: wp.array[wp.mat33],
+):
+    """Add each rotational DOF's armature [kg m^2] to the child body's inertia: ``armature * I3`` (isotropic, always a
+    valid inertia) or ``armature * a a^T`` about the joint axis in the child frame. Maximal coordinates cannot represent
+    a rotor spinning relative to its parent exactly; both variants are approximations (exact about the axis for a
+    joint whose parent is fixed)."""
+    tid = wp.tid()
+    type = joint_type[tid]
+    if type == JointType.FREE or type == JointType.DISTANCE or type == JointType.FIXED:
+        return
+    qd_start = joint_qd_start[tid]
+    lin_axis_count = joint_dof_dim[tid, 0]
+    ang_axis_count = joint_dof_dim[tid, 1]
+    q_cj = wp.transform_get_rotation(joint_X_c[tid])
+    added = wp.mat33(0.0)
+    for k in range(ang_axis_count):
+        idx = qd_start + lin_axis_count + k
+        arm = joint_armature[idx]
+        if type == JointType.BALL:
+            idx = qd_start + k
+            arm = joint_armature[idx]
+        if arm > 0.0:
+            if isotropic != 0:
+                added += arm * wp.identity(3, dtype=float)
+            else:
+                a = wp.quat_rotate(q_cj, wp.normalize(joint_axis[idx]))
+                added += arm * wp.outer(a, a)
+    wp.atomic_add(body_inertia, joint_child[tid], added)
+
+
+@wp.kernel
+def invert_body_inertia(
+    body_flags: wp.array[wp.int32],
+    body_inv_mass: wp.array[float],
+    body_inertia: wp.array[wp.mat33],
+    inv_inertia: wp.array[wp.mat33],
+    eff_inv_inertia: wp.array[wp.mat33],
+):
+    tid = wp.tid()
+    I_inv = wp.mat33(0.0)
+    if body_inv_mass[tid] > 0.0:
+        I_inv = wp.inverse(body_inertia[tid])
+    inv_inertia[tid] = I_inv
+    if (body_flags[tid] & BodyFlags.KINEMATIC) != 0:
+        eff_inv_inertia[tid] = wp.mat33(0.0)
+    else:
+        eff_inv_inertia[tid] = I_inv
+
+
+@wp.func
+def axis_inv_inertia_at(
+    X_b: wp.transform, com: wp.vec3, inv_I: wp.mat33, inv_m: float, a_w: wp.vec3, X_anchor: wp.transform
+) -> float:
+    """Inverse moment of inertia of a body about the world axis ``a_w`` through its COM: a torque applied at the
+    start of the step first rotates each body about its COM (the joint rows then move the rotation to the anchor),
+    so this is the mobility that decides the stability of an explicit joint force."""
+    if inv_m == 0.0:
+        return 0.0
+    a_b = wp.quat_rotate_inv(wp.transform_get_rotation(X_b), a_w)
+    w_com = wp.dot(a_b, inv_I * a_b)
+    if w_com <= 0.0:
+        return 0.0
+    return w_com
+
+
+@wp.kernel
+def compute_joint_drive_warmstart(
+    body_q: wp.array[wp.transform],
+    joint_type: wp.array[int],
+    joint_enabled: wp.array[bool],
+    joint_parent: wp.array[int],
+    joint_child: wp.array[int],
+    joint_X_p: wp.array[wp.transform],
+    joint_X_c: wp.array[wp.transform],
+    joint_qd_start: wp.array[int],
+    joint_target_q_start: wp.array[int],
+    joint_dof_dim: wp.array2d[int],
+    joint_axis: wp.array[wp.vec3],
+    joint_limit_lower: wp.array[float],
+    joint_limit_upper: wp.array[float],
+    joint_target_q: wp.array[float],
+    joint_target_ke: wp.array[float],
+    joint_effort_limit: wp.array[float],
+    body_inv_I: wp.array[wp.mat33],
+    body_inv_m: wp.array[float],
+    body_qd: wp.array[wp.spatial_vector],
+    body_com: wp.array[wp.vec3],
+    joint_target_qd: wp.array[float],
+    joint_target_kd: wp.array[float],
+    drive_mode: int,
+    dt: float,
+    # outputs
+    drive_f: wp.array[float],
+    drive_impulse: wp.array[wp.spatial_vector],
+):
+    """Explicit stiffness part of the joint drives at the start of the step, ``clamp(ke * (target - q), +-effort)``
+    per DOF (applied like ``Control.joint_f``) and the matching initial accumulated impulse per constraint row
+    (warm start of :func:`joint_drive_delta_impulse`). At a static equilibrium the rows then need no correction, so
+    the equilibrium is exact at any iteration count. Rows of D6 joints with several rotational DOFs start at zero."""
+    tid = wp.tid()
+    drive_impulse[tid] = wp.spatial_vector()
+    type = joint_type[tid]
+    qd_start = joint_qd_start[tid]
+    lin_axis_count = joint_dof_dim[tid, 0]
+    ang_axis_count = joint_dof_dim[tid, 1]
+    for k in range(lin_axis_count + ang_axis_count):
+        drive_f[qd_start + k] = 0.0
+    if not joint_enabled[tid]:
+        return
+    if type != JointType.REVOLUTE and type != JointType.PRISMATIC and type != JointType.D6:
+        return
+    id_p = joint_parent[tid]
+    id_c = joint_child[tid]
+    X_wp = joint_X_p[tid]
+    w_lin = body_inv_m[id_c]
+    if id_p >= 0:
+        X_wp = body_q[id_p] * X_wp
+        w_lin += body_inv_m[id_p]
+    X_wc = body_q[id_c] * joint_X_c[tid]
+    t_start = joint_target_q_start[tid]
+    rel = wp.transform_inverse(X_wp) * X_wc
+    lin = wp.vec3(0.0)
+    ang = wp.vec3(0.0)
+    n = lin_axis_count
+    if ang_axis_count == 1:
+        n += 1
+    for k in range(n):
+        idx = qd_start + k
+        ke = joint_target_ke[idx]
+        kd = joint_target_kd[idx]
+        if (drive_mode == 1 and ke > 0.0) or (drive_mode == 2 and (ke > 0.0 or kd > 0.0)):
+            axis = wp.normalize(joint_axis[idx])
+            lower = joint_limit_lower[idx]
+            upper = joint_limit_upper[idx]
+            target = wp.clamp(joint_target_q[t_start + k], lower, upper)
+            q = float(0.0)
+            if k < lin_axis_count:
+                q = wp.dot(wp.transform_get_translation(rel), axis)
+            else:
+                ref = joint_angle_reference(lower, upper)
+                if not (upper >= lower and upper - lower < 2.0 * wp.pi):
+                    ref = target
+                q = wrap_angle_near(wp.quat_twist_angle_signed(axis, wp.transform_get_rotation(rel)), ref)
+            eff = joint_effort_limit[idx]
+            f = wp.clamp(ke * (target - q), -eff, eff)
+            # inverse inertia about the joint axis (both bodies, about their COMs), or inverse mass for a linear DOF
+            a_w = wp.transform_vector(X_wp, axis)
+            w = w_lin
+            if k >= lin_axis_count:
+                w = axis_inv_inertia_at(body_q[id_c], body_com[id_c], body_inv_I[id_c], body_inv_m[id_c], a_w, X_wc)
+                if id_p >= 0:
+                    w += axis_inv_inertia_at(
+                        body_q[id_p], body_com[id_p], body_inv_I[id_p], body_inv_m[id_p], a_w, X_wc
+                    )
+            x = ke * dt * dt * w
+            if drive_mode == 1:
+                # warm start of the implicit rows: stable fraction of the explicit stiffness force
+                f = f / (1.0 + x)
+            else:
+                # drive_mode 2: PD law of the start state, applied as a force: stiffness explicit, damping backward-Euler
+                # on its own effect; exact at rest whatever the load. An explicit spring diverges when ke dt^2 w
+                # approaches 4 (light links, e.g. fingers, without armature): scaling it by 1 / (1 + x^2),
+                # x = ke dt^2 w, keeps the per-step gain x / (1 + x^2) <= 0.5 and changes it by O(x^2) where x << 1.
+                qd = float(0.0)
+                if k < lin_axis_count:
+                    x_anchor = wp.transform_get_translation(X_wc)
+                    v_c = velocity_at_point(body_qd[id_c], x_anchor - wp.transform_point(body_q[id_c], body_com[id_c]))
+                    v_p = wp.vec3(0.0)
+                    if id_p >= 0:
+                        v_p = velocity_at_point(
+                            body_qd[id_p], x_anchor - wp.transform_point(body_q[id_p], body_com[id_p])
+                        )
+                    qd = wp.dot(v_c - v_p, a_w)
+                else:
+                    w_rel = wp.spatial_bottom(body_qd[id_c])
+                    if id_p >= 0:
+                        w_rel -= wp.spatial_bottom(body_qd[id_p])
+                    qd = wp.dot(w_rel, a_w)
+                f = ke * (target - q) / (1.0 + x * x) + kd * (joint_target_qd[idx] - qd) / (1.0 + kd * dt * w)
+                f = wp.clamp(f, -eff, eff)
+            drive_f[idx] = f
+            if k < lin_axis_count:
+                lin += axis * (f * dt)
+            else:
+                ang += axis * (f * dt)
+    drive_impulse[tid] = wp.spatial_vector(lin, ang)
+
+
 @wp.kernel
 def solve_body_joints(
     body_q: wp.array[wp.transform],
@@ -1582,10 +1810,21 @@ def solve_body_joints(
     joint_angular_compliance: float,
     angular_relaxation: float,
     linear_relaxation: float,
+    linear_row_angular_relaxation: float,
+    drive_mode: int,
+    joint_effort_limit: wp.array[float],
+    drive_impulse: wp.array[wp.spatial_vector],
     dt: float,
     deltas: wp.array[wp.spatial_vector],
     joint_impulse: wp.array[wp.spatial_vector],
 ):
+    # ``drive_mode`` 1: position/velocity drives are implicit PD rows with an impulse accumulated in
+    # ``drive_impulse`` (per joint, linear rows then angular rows; initialized each step by
+    # :func:`compute_joint_drive_warmstart`), see :func:`joint_drive_delta_impulse`. 0: the legacy compliance rows
+    # (compliance 1 / ke, damping kd / ke, no accumulation: the effective stiffness grows with the iteration count).
+    # ``linear_row_angular_relaxation`` scales the angular part (the moment about each body's COM) of the impulse
+    # of a positional row. It must equal ``linear_relaxation`` for the row to apply one consistent impulse; the
+    # legacy behaviour used ``angular_relaxation`` there, which transmits joint torque and gravity wrongly.
     tid = wp.tid()
     type = joint_type[tid]
 
@@ -1638,6 +1877,28 @@ def solve_body_joints(
     if m_inv_p == 0.0 and m_inv_c == 0.0:
         # connection between two immovable bodies
         return
+
+    # accumulated drive impulses of this joint's rows (drive_mode 1), written back at the end
+    drive_accum = wp.spatial_vector()
+    if drive_mode >= 1:
+        drive_accum = drive_impulse[tid]
+    # drive rows found by the loops below, solved last (Gauss-Seidel after this joint's hard rows)
+    lin_drive_on = wp.vec3(0.0)
+    lin_drive_err = wp.vec3(0.0)
+    lin_drive_derr = wp.vec3(0.0)
+    lin_drive_ke = wp.vec3(0.0)
+    lin_drive_kd = wp.vec3(0.0)
+    lin_drive_max = wp.vec3(0.0)
+    lin_drive_dir = wp.mat33(0.0)
+    lin_drive_ang_p = wp.mat33(0.0)
+    lin_drive_ang_c = wp.mat33(0.0)
+    ang_drive_on = wp.vec3(0.0)
+    ang_drive_err = wp.vec3(0.0)
+    ang_drive_derr = wp.vec3(0.0)
+    ang_drive_ke = wp.vec3(0.0)
+    ang_drive_kd = wp.vec3(0.0)
+    ang_drive_max = wp.vec3(0.0)
+    ang_drive_dir = wp.mat33(0.0)
 
     # accumulate constraint deltas
     lin_delta_p = wp.vec3(0.0)
@@ -1727,9 +1988,9 @@ def solve_body_joints(
             )
 
             lin_delta_p += linear_p * (d_lambda * linear_relaxation)
-            ang_delta_p += angular_p * (d_lambda * angular_relaxation)
+            ang_delta_p += angular_p * (d_lambda * linear_row_angular_relaxation)
             lin_delta_c += linear_c * (d_lambda * linear_relaxation)
-            ang_delta_c += angular_c * (d_lambda * angular_relaxation)
+            ang_delta_c += angular_c * (d_lambda * linear_row_angular_relaxation)
 
     else:
         # compute joint target, stiffness, damping
@@ -1737,6 +1998,7 @@ def solve_body_joints(
 
         axis_target_pos_ke = wp.spatial_vector()
         axis_target_vel_kd = wp.spatial_vector()
+        axis_effort = wp.vec3(0.0)
         # avoid a for loop here since local variables would need to be modified which is not yet differentiable
         if lin_axis_count > 0:
             axis = joint_axis[axis_start]
@@ -1745,6 +2007,7 @@ def solve_body_joints(
             axis_limits = wp.spatial_vector(vec_min(lo_temp, up_temp), vec_max(lo_temp, up_temp))
             ke = joint_target_ke[axis_start]
             kd = joint_target_kd[axis_start]
+            axis_effort = vec_max(axis_effort, vec_abs(axis) * joint_effort_limit[axis_start])
             target_pos = joint_target_q[target_axis_start]
             target_vel = joint_target_qd[axis_start]
             if ke > 0.0:  # has position control
@@ -1760,6 +2023,7 @@ def solve_body_joints(
             axis_limits = update_joint_axis_limits(axis, lower, upper, axis_limits)
             ke = joint_target_ke[axis_idx]
             kd = joint_target_kd[axis_idx]
+            axis_effort = vec_max(axis_effort, vec_abs(axis) * joint_effort_limit[axis_idx])
             target_pos = joint_target_q[target_axis_idx]
             target_vel = joint_target_qd[axis_idx]
             if ke > 0.0:  # has position control
@@ -1775,6 +2039,7 @@ def solve_body_joints(
             axis_limits = update_joint_axis_limits(axis, lower, upper, axis_limits)
             ke = joint_target_ke[axis_idx]
             kd = joint_target_kd[axis_idx]
+            axis_effort = vec_max(axis_effort, vec_abs(axis) * joint_effort_limit[axis_idx])
             target_pos = joint_target_q[target_axis_idx]
             target_vel = joint_target_qd[axis_idx]
             if ke > 0.0:  # has position control
@@ -1838,6 +2103,7 @@ def solve_body_joints(
             err = 0.0
             compliance = linear_compliance
             damping = 0.0
+            is_drive = False
 
             target_vel = axis_target_vel[dim]
             derr_rel = derr - target_vel
@@ -1853,7 +2119,12 @@ def solve_body_joints(
                 target_pos = axis_target_pos[dim]
                 target_pos = wp.clamp(target_pos, lower, upper)
 
-                if axis_stiffness[dim] > 0.0:
+                if drive_mode == 2 and (axis_stiffness[dim] > 0.0 or axis_damping[dim] > 0.0):
+                    err = 0.0  # applied as a force at the start of the step (compute_joint_drive_warmstart)
+                elif drive_mode == 1 and (axis_stiffness[dim] > 0.0 or axis_damping[dim] > 0.0):
+                    is_drive = True
+                    err = e - target_pos
+                elif axis_stiffness[dim] > 0.0:
                     err = e - target_pos
                     compliance = 1.0 / axis_stiffness[dim]
                     damping = axis_damping[dim]
@@ -1861,7 +2132,19 @@ def solve_body_joints(
                     compliance = 1.0 / axis_damping[dim]
                     damping = axis_damping[dim]
 
-            if wp.abs(err) > 1e-9 or wp.abs(derr_rel) > 1e-9:
+            if is_drive:
+                # solved after the joint's other rows (see the end of the kernel)
+                lin_drive_on[dim] = 1.0
+                lin_drive_err[dim] = err
+                lin_drive_derr[dim] = derr_rel
+                lin_drive_ke[dim] = axis_stiffness[dim]
+                lin_drive_kd[dim] = axis_damping[dim]
+                lin_drive_max[dim] = axis_effort[dim] * dt
+                for i in range(3):
+                    lin_drive_dir[i, dim] = linear_c[i]
+                    lin_drive_ang_p[i, dim] = angular_p[i]
+                    lin_drive_ang_c[i, dim] = angular_c[i]
+            elif wp.abs(err) > 1e-9 or wp.abs(derr_rel) > 1e-9:
                 lambda_in = 0.0
                 d_lambda = compute_positional_correction(
                     err,
@@ -1883,9 +2166,9 @@ def solve_body_joints(
                 )
 
                 lin_delta_p += linear_p * (d_lambda * linear_relaxation)
-                ang_delta_p += angular_p * (d_lambda * angular_relaxation)
+                ang_delta_p += angular_p * (d_lambda * linear_row_angular_relaxation)
                 lin_delta_c += linear_c * (d_lambda * linear_relaxation)
-                ang_delta_c += angular_c * (d_lambda * angular_relaxation)
+                ang_delta_c += angular_c * (d_lambda * linear_row_angular_relaxation)
 
     if type == JointType.FIXED or type == JointType.PRISMATIC or type == JointType.REVOLUTE or type == JointType.D6:
         # handle angular constraints
@@ -1977,6 +2260,7 @@ def solve_body_joints(
 
         axis_target_pos_ke = wp.spatial_vector()  # [weighted_target_pos, ke_weights]
         axis_target_vel_kd = wp.spatial_vector()  # [weighted_target_vel, kd_weights]
+        axis_effort = wp.vec3(0.0)
         # avoid a for loop here since local variables would need to be modified which is not yet differentiable
         if ang_axis_count > 0:
             axis_idx = axis_start + lin_axis_count
@@ -1987,6 +2271,7 @@ def solve_body_joints(
             axis_limits = wp.spatial_vector(vec_min(lo_temp, up_temp), vec_max(lo_temp, up_temp))
             ke = joint_target_ke[axis_idx]
             kd = joint_target_kd[axis_idx]
+            axis_effort = vec_max(axis_effort, vec_abs(axis) * joint_effort_limit[axis_idx])
             target_pos = joint_target_q[target_axis_idx]
             target_vel = joint_target_qd[axis_idx]
             if ke > 0.0:  # has position control
@@ -2002,6 +2287,7 @@ def solve_body_joints(
             axis_limits = update_joint_axis_limits(axis, lower, upper, axis_limits)
             ke = joint_target_ke[axis_idx]
             kd = joint_target_kd[axis_idx]
+            axis_effort = vec_max(axis_effort, vec_abs(axis) * joint_effort_limit[axis_idx])
             target_pos = joint_target_q[target_axis_idx]
             target_vel = joint_target_qd[axis_idx]
             if ke > 0.0:  # has position control
@@ -2017,6 +2303,7 @@ def solve_body_joints(
             axis_limits = update_joint_axis_limits(axis, lower, upper, axis_limits)
             ke = joint_target_ke[axis_idx]
             kd = joint_target_kd[axis_idx]
+            axis_effort = vec_max(axis_effort, vec_abs(axis) * joint_effort_limit[axis_idx])
             target_pos = joint_target_q[target_axis_idx]
             target_vel = joint_target_qd[axis_idx]
             if ke > 0.0:  # has position control
@@ -2061,6 +2348,7 @@ def solve_body_joints(
             err = 0.0
             compliance = angular_compliance
             damping = 0.0
+            is_drive = False
 
             target_vel = axis_target_vel[dim]
             angular_c_len = wp.length(angular_c)
@@ -2077,7 +2365,13 @@ def solve_body_joints(
                 target_pos = axis_target_pos[dim]
                 target_pos = wp.clamp(target_pos, lower, upper)
 
-                if axis_stiffness[dim] > 0.0:
+                if drive_mode == 2 and ang_axis_count <= 1 and (axis_stiffness[dim] > 0.0 or axis_damping[dim] > 0.0):
+                    err = 0.0  # applied as a force at the start of the step (compute_joint_drive_warmstart)
+                elif drive_mode >= 1 and (axis_stiffness[dim] > 0.0 or axis_damping[dim] > 0.0):
+                    # drive_mode 2 cannot evaluate several coupled rotational DOFs at the start of the step: rows
+                    is_drive = True
+                    err = e - target_pos
+                elif axis_stiffness[dim] > 0.0:
                     err = e - target_pos
                     compliance = 1.0 / axis_stiffness[dim]
                     damping = axis_damping[dim]
@@ -2085,16 +2379,106 @@ def solve_body_joints(
                     damping = axis_damping[dim]
                     compliance = 1.0 / axis_damping[dim]
 
-            d_lambda = (
-                compute_angular_correction(
-                    err, derr_rel, pose_p, pose_c, I_inv_p, I_inv_c, angular_p, angular_c, 0.0, compliance, damping, dt
+            d_lambda = float(0.0)
+            if is_drive:
+                if ang_axis_count == 1:
+                    # the swing-twist gradients above omit the derivative of the angle rescaling (|grad| = 0.94 at
+                    # 0.87 rad): harmless for hard rows, but a drive row would apply ke * |grad|. For one rotational
+                    # DOF the exact row direction is the joint-frame axis of this dimension.
+                    unit_dim = wp.vec3(0.0)
+                    unit_dim[dim] = 1.0
+                    angular_c = wp.quat_rotate(q_p, unit_dim)
+                    derr_rel = wp.dot(angular_c, omega_c - omega_p) - target_vel
+                # solved after the joint's other rows (see the end of the kernel)
+                ang_drive_on[dim] = 1.0
+                ang_drive_err[dim] = err
+                ang_drive_derr[dim] = derr_rel
+                ang_drive_ke[dim] = axis_stiffness[dim]
+                ang_drive_kd[dim] = axis_damping[dim]
+                ang_drive_max[dim] = axis_effort[dim] * dt
+                for i in range(3):
+                    ang_drive_dir[i, dim] = angular_c[i]
+            else:
+                d_lambda = (
+                    compute_angular_correction(
+                        err,
+                        derr_rel,
+                        pose_p,
+                        pose_c,
+                        I_inv_p,
+                        I_inv_c,
+                        angular_p,
+                        angular_c,
+                        0.0,
+                        compliance,
+                        damping,
+                        dt,
+                    )
+                    * angular_relaxation
                 )
-                * angular_relaxation
-            )
 
             # update deltas
             ang_delta_p += angular_p * d_lambda
             ang_delta_c += angular_c * d_lambda
+
+    if drive_mode >= 1:
+        # Drive rows, Gauss-Seidel after the hard rows of this joint: their error and rate include the effect of
+        # the corrections already accumulated above (otherwise a drive would, e.g., damp the rotation about the
+        # child COM that the anchor rows turn into a rotation about the pivot in the same iteration, and settle
+        # with a biased force).
+        R_p = wp.quat_to_matrix(wp.transform_get_rotation(pose_p))
+        R_c = wp.quat_to_matrix(wp.transform_get_rotation(pose_c))
+        W_p = R_p * I_inv_p * wp.transpose(R_p)
+        W_c = R_c * I_inv_c * wp.transpose(R_c)
+        for dim in range(3):
+            if lin_drive_on[dim] > 0.0:
+                n = wp.vec3(lin_drive_dir[0, dim], lin_drive_dir[1, dim], lin_drive_dir[2, dim])
+                a_p = wp.vec3(lin_drive_ang_p[0, dim], lin_drive_ang_p[1, dim], lin_drive_ang_p[2, dim])
+                a_c = wp.vec3(lin_drive_ang_c[0, dim], lin_drive_ang_c[1, dim], lin_drive_ang_c[2, dim])
+                dv = (
+                    wp.dot(n, lin_delta_c * m_inv_c - lin_delta_p * m_inv_p)
+                    + wp.dot(a_c, W_c * ang_delta_c)
+                    + wp.dot(a_p, W_p * ang_delta_p)
+                )
+                w = m_inv_p + m_inv_c + wp.dot(a_c, W_c * a_c) + wp.dot(a_p, W_p * a_p)
+                impulse = spatial_get(drive_accum, dim)
+                d = joint_drive_delta_impulse(
+                    impulse,
+                    lin_drive_err[dim] + dt * dv,
+                    lin_drive_derr[dim] + dv,
+                    w,
+                    lin_drive_ke[dim],
+                    lin_drive_kd[dim],
+                    lin_drive_max[dim],
+                    linear_relaxation,
+                    dt,
+                )
+                drive_accum[dim] = impulse + d
+                lin_delta_p -= n * d
+                ang_delta_p += a_p * d
+                lin_delta_c += n * d
+                ang_delta_c += a_c * d
+        for dim in range(3):
+            if ang_drive_on[dim] > 0.0:
+                a = wp.vec3(ang_drive_dir[0, dim], ang_drive_dir[1, dim], ang_drive_dir[2, dim])
+                dw = wp.dot(a, W_c * ang_delta_c) - wp.dot(a, W_p * ang_delta_p)
+                w = wp.dot(a, W_c * a) + wp.dot(a, W_p * a)
+                impulse = spatial_get(drive_accum, 3 + dim)
+                d = joint_drive_delta_impulse(
+                    impulse,
+                    ang_drive_err[dim] + dt * dw,
+                    ang_drive_derr[dim] + dw,
+                    w,
+                    ang_drive_ke[dim],
+                    ang_drive_kd[dim],
+                    ang_drive_max[dim],
+                    angular_relaxation,
+                    dt,
+                )
+                drive_accum[3 + dim] = impulse + d
+                ang_delta_p -= a * d
+                ang_delta_c += a * d
+        drive_impulse[tid] = drive_accum
 
     if id_p >= 0:
         wp.atomic_add(deltas, id_p, wp.spatial_vector(lin_delta_p, ang_delta_p))
@@ -2393,6 +2777,43 @@ def compute_contact_constraint_delta(
         delta_lambda /= dt * denom
 
     return delta_lambda * relaxation
+
+
+@wp.func
+def compute_positional_inv_mass(
+    tf_a: wp.transform,
+    tf_b: wp.transform,
+    m_inv_a: float,
+    m_inv_b: float,
+    I_inv_a: wp.mat33,
+    I_inv_b: wp.mat33,
+    linear_a: wp.vec3,
+    linear_b: wp.vec3,
+    angular_a: wp.vec3,
+    angular_b: wp.vec3,
+) -> float:
+    rot_angular_a = wp.quat_rotate_inv(wp.transform_get_rotation(tf_a), angular_a)
+    rot_angular_b = wp.quat_rotate_inv(wp.transform_get_rotation(tf_b), angular_b)
+    return (
+        wp.length_sq(linear_a) * m_inv_a
+        + wp.length_sq(linear_b) * m_inv_b
+        + wp.dot(rot_angular_a, I_inv_a * rot_angular_a)
+        + wp.dot(rot_angular_b, I_inv_b * rot_angular_b)
+    )
+
+
+@wp.func
+def compute_angular_inv_mass(
+    tf_a: wp.transform,
+    tf_b: wp.transform,
+    I_inv_a: wp.mat33,
+    I_inv_b: wp.mat33,
+    angular_a: wp.vec3,
+    angular_b: wp.vec3,
+) -> float:
+    rot_angular_a = wp.quat_rotate_inv(wp.transform_get_rotation(tf_a), angular_a)
+    rot_angular_b = wp.quat_rotate_inv(wp.transform_get_rotation(tf_b), angular_b)
+    return wp.dot(rot_angular_a, I_inv_a * rot_angular_a) + wp.dot(rot_angular_b, I_inv_b * rot_angular_b)
 
 
 @wp.func
