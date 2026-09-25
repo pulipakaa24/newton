@@ -308,6 +308,21 @@ def test_joint_drive_light_damped_chain(test, device):
     np.testing.assert_allclose(q.numpy(), 0.3 * (1.0 - np.exp(-0.05 * 40.0 / 10.0)), rtol=0.1)
 
 
+def test_joint_drive_gains_set_after_construction(test, device):
+    """Drive gains written to the model after the solver is created take effect with an explicit joint_drive_mode,
+    or with the default after notify_model_changed(JOINT_DOF_PROPERTIES)."""
+    for explicit in (True, False):
+        model = _pendulum_model(device, target=0.5)
+        solver = newton.solvers.SolverXPBD(model, iterations=4, **({"joint_drive_mode": "pd"} if explicit else {}))
+        model.joint_target_ke.fill_(200.0)
+        model.joint_target_kd.fill_(5.0)
+        if not explicit:
+            solver.notify_model_changed(newton.ModelFlags.JOINT_DOF_PROPERTIES)
+        q, _ = _run(model, solver, 800, 2.5e-3)
+        tau_g = float(model.body_mass.numpy()[0]) * 9.81 * float(model.body_com.numpy()[0][0]) * np.cos(q)
+        test.assertAlmostEqual(tau_g / (q - 0.5) / 200.0, 1.0, delta=0.01, msg=f"explicit {explicit}")
+
+
 devices = get_test_devices()
 
 
@@ -397,6 +412,13 @@ add_function_test(
     TestSolverXPBDJoints,
     "test_joint_drive_light_damped_chain",
     test_joint_drive_light_damped_chain,
+    devices=devices,
+    check_output=False,
+)
+add_function_test(
+    TestSolverXPBDJoints,
+    "test_joint_drive_gains_set_after_construction",
+    test_joint_drive_gains_set_after_construction,
     devices=devices,
     check_output=False,
 )

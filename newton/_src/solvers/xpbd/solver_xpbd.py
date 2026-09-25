@@ -146,7 +146,7 @@ class SolverXPBD(SolverBase, CouplingInterface):
         rigid_contact_con_weighting: bool = True,
         angular_damping: float = 0.0,
         joint_legacy_relaxation: bool = False,
-        joint_drive_mode: str = "pd",
+        joint_drive_mode: str | None = None,
         joint_drive_relaxation: float = 1.0,
         joint_armature_inertia: str = "none",
         joint_extra_iterations: int = 0,
@@ -203,7 +203,10 @@ class SolverXPBD(SolverBase, CouplingInterface):
                 ``"implicit"``: implicit (backward-Euler) PD rows with an impulse accumulated over the iterations,
                 exact when the iterations converge, stable for any gains. ``"compliance"``: the former compliance
                 rows (compliance ``1 / ke``, damping ``kd / ke``, no multiplier accumulation), whose effective
-                stiffness grows with the iteration count and which ignore the effort limit.
+                stiffness grows with the iteration count and which ignore the effort limit. Defaults to ``"pd"``; left
+                at the default, the drive kernels run only for the joints that have gains when the solver is created or
+                at :meth:`notify_model_changed` (``JOINT_DOF_PROPERTIES``), so a model without drives costs nothing;
+                pass it explicitly to have gains set on the model later take effect without that call.
             joint_drive_relaxation: Relaxation factor of the drive rows (the damper of ``"pd"``, the PD rows of
                 ``"implicit"``) [dimensionless]; a row is exact for its own DOF in one step at 1.0. Defaults to 1.0.
             joint_armature_inertia: How :attr:`~newton.Model.joint_armature` of rotational DOFs enters the dynamics:
@@ -246,6 +249,9 @@ class SolverXPBD(SolverBase, CouplingInterface):
         self.joint_linear_compliance = joint_linear_compliance
         self.joint_angular_compliance = joint_angular_compliance
         self.joint_legacy_relaxation = joint_legacy_relaxation
+        self._drive_mode_explicit = joint_drive_mode is not None
+        if joint_drive_mode is None:
+            joint_drive_mode = "pd"
         if joint_drive_mode not in self._DRIVE_MODES:
             raise ValueError(f"joint_drive_mode must be one of {tuple(self._DRIVE_MODES)}, not {joint_drive_mode!r}")
         self.joint_drive_mode = joint_drive_mode
@@ -368,10 +374,11 @@ class SolverXPBD(SolverBase, CouplingInterface):
             self._refresh_rigid_restitution_enabled()
 
     def _refresh_drive_joints(self):
-        """Joints with a position or velocity drive (``joint_target_ke``/``kd`` > 0) on a linear DOF or on the single
-        rotational DOF: the drive kernels run over these only. Read from the model at construction and by
-        :meth:`notify_model_changed` (``JOINT_DOF_PROPERTIES``): gains set on the model afterwards take effect after
-        that call (until then such drives act as the ``"compliance"`` rows)."""
+        """Joints the drive kernels run over. With ``joint_drive_mode`` left at its default: the joints with a
+        position or velocity drive (``joint_target_ke``/``kd`` > 0) on a linear DOF or on the single rotational DOF,
+        read at construction and by :meth:`notify_model_changed` (``JOINT_DOF_PROPERTIES``); gains set on the model
+        afterwards take effect after that call (until then such drives act as the ``"compliance"`` rows). With an
+        explicit ``joint_drive_mode``: every joint that can carry such a drive."""
         model = self.model
         if not model.joint_count:
             return
@@ -386,7 +393,9 @@ class SolverXPBD(SolverBase, CouplingInterface):
                 continue
             n = int(dof_dim[j, 0]) + (1 if int(dof_dim[j, 1]) == 1 else 0)
             d = int(qd_start[j])
-            if np.any(ke[d : d + n] > 0.0) or np.any(kd[d : d + n] > 0.0):
+            # an explicitly requested drive mode covers every joint that can carry a drive (the kernels skip joints
+            # without gains), so gains set on the model later need no notify_model_changed
+            if self._drive_mode_explicit or np.any(ke[d : d + n] > 0.0) or np.any(kd[d : d + n] > 0.0):
                 ids.append(j)
         self._drive_joint_count = len(ids)
         self._drive_joints = wp.array(np.array(ids or [0], dtype=np.int32), dtype=int, device=model.device)
