@@ -131,6 +131,16 @@ def _scale_linear_system_by_environment(
         solution[i] = factor * solution[i]
 
 
+def _color_block_count(device) -> int:
+    """Blocks per color launch: two per SM on GPUs (CUDA, Metal), one on the CPU.
+
+    Blocks within a color touch disjoint nodes, so the result does not depend on this count.
+    """
+    if device.is_cuda or getattr(device, "is_metal", False):
+        return device.sm_count * 2
+    return 1
+
+
 class ArraySquaredNorm:
     """Utility to compute squared L2 norm of a large array via tiled reductions."""
 
@@ -688,10 +698,7 @@ class _GaussSeidelSolver(_RheologySolver):
 
         self.color_count = self.rheology.color_offsets.shape[0] - 1
 
-        if self.device.is_cuda:
-            color_block_count = self.device.sm_count * 2
-        else:
-            color_block_count = 1
+        color_block_count = _color_block_count(self.device)
         color_block_dim = 64
         color_launch_dim = color_block_count * color_block_dim
 
@@ -887,10 +894,7 @@ class _ReorderedGaussSeidelSolver(_RheologySolver):
 
         # ── Launch config ────────────────────────────────────────────────
 
-        if self.device.is_cuda:
-            color_block_count = self.device.sm_count * 2
-        else:
-            color_block_count = 1
+        color_block_count = _color_block_count(self.device)
         color_block_dim = 64
         color_launch_dim = color_block_count * color_block_dim
 
@@ -1130,10 +1134,7 @@ class _BatchedGaussSeidelSolver(_RheologySolver):
 
         # ── Launch config ────────────────────────────────────────────────
 
-        if self.device.is_cuda:
-            color_block_count = self.device.sm_count * 2
-        else:
-            color_block_count = 1
+        color_block_count = _color_block_count(self.device)
         color_block_dim = 64
         color_launch_dim = color_block_count * color_block_dim
 
