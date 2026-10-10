@@ -2170,7 +2170,7 @@ class SolverImplicitMPM(SolverBase, CouplingInterface):
             else:
                 # Compute bounds and transfer to host
                 device = positions.device
-                if device.is_cuda:
+                if device.is_cuda or getattr(device, "is_metal", False):
                     min_dev = fem.borrow_temporary(temporary_store, shape=1, dtype=wp.vec3, device=device)
                     max_dev = fem.borrow_temporary(temporary_store, shape=1, dtype=wp.vec3, device=device)
 
