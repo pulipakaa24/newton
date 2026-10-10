@@ -39,7 +39,7 @@ from ...utils.benchmark import event_scope
 from ...utils.import_utils import string_to_warp
 from ..coupled.interface import CouplingEndpointKind, CouplingInterface
 from ..solver import SolverBase
-from . import kernels
+from . import kernels, ordered_broadphase
 from .collision_masks import (
     MUJOCO_COLLISION_MASK_DOMAIN_UNSET,
     MUJOCO_COLLISION_MASK_UNSET,
@@ -3550,6 +3550,9 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
             # as the single source of truth instead of relying on global Warp
             # determinism during module import.
             self._set_mujoco_warp_module_options()
+            if getattr(model.device, "is_metal", False):
+                # Metal SIMD-groups reach the broadphase pair counter in varying order; restore CUDA's thread order.
+                ordered_broadphase.install()
 
         # Deferred from module scope: wp.static() in this kernel imports mujoco_warp.
         if SolverMuJoCo._convert_mjw_contacts_to_newton_kernel is None:
