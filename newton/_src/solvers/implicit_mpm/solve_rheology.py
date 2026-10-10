@@ -156,7 +156,8 @@ class ArraySquaredNorm:
         self.batch_sum_launch = None
 
         if batch_offsets is not None:
-            if not self.device.is_cuda:
+            # Metal runs the tiled reduction like CUDA (same per-lane partial sums and tile reduction structure).
+            if not (self.device.is_cuda or getattr(self.device, "is_metal", False)):
                 self.tile_size = 1
 
             batch_count = batch_offsets.shape[0] - 1
@@ -1499,7 +1500,8 @@ class _LinearSolver:
 
     def _scale_batched_system(self, tolerance_scales: wp.array[float], inverse: bool):
         environment_offsets = self.rheology.strain_environment_offsets
-        block_dim = 256 if self.momentum.velocity.device.is_cuda else 1
+        device = self.momentum.velocity.device
+        block_dim = 256 if device.is_cuda or getattr(device, "is_metal", False) else 1
         wp.launch(
             _scale_linear_system_by_environment,
             dim=(tolerance_scales.shape[0], block_dim),
