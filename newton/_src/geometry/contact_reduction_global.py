@@ -270,11 +270,16 @@ def make_contact_key(shape_a: int, shape_b: int, bin_id: int) -> wp.uint64:
 
 # 22-bit fingerprint is wide enough to distinguish any two contacts that share
 # the same truncated score within a single reduction slot.  The remaining 20
-# bits for contact_id support up to 1,048,575 buffered contacts.
+# bits for contact_id support up to 1,048,575 buffered contacts.  A reducer with
+# a larger capacity widens the contact_id field (up to MAX_CONTACT_ID_BITS) and
+# narrows the fingerprint by the same amount, so the score bits never change;
+# its ``deterministic`` flag carries the contact_id width.
 FINGERPRINT_BITS = wp.constant(wp.uint64(22))
 CONTACT_ID_BITS = wp.constant(wp.uint64(20))
 CONTACT_ID_MASK = wp.constant(wp.uint64((1 << 20) - 1))
 FINGERPRINT_MASK = wp.constant(wp.uint64((1 << 22) - 1))
+MAX_CONTACT_ID_BITS = 24
+_SCORE_FIELD_SHIFT = wp.constant(wp.uint64(42))
 # Plain Python int (not wp.constant) because it is used inside wp.static()
 # which requires a Python-level value for compile-time evaluation.
 SCORE_SHIFT = 10
@@ -351,7 +356,17 @@ def _unpack_contact_id_fast(packed: wp.uint64) -> int:
 
 
 @wp.func
-def _make_contact_value_det(score: float, fingerprint: int, contact_id: int) -> wp.uint64:
+def _contact_id_mask(id_bits: int) -> wp.uint64:
+    return (wp.uint64(1) << wp.uint64(id_bits)) - wp.uint64(1)
+
+
+@wp.func
+def _fingerprint_mask(id_bits: int) -> wp.uint64:
+    return (wp.uint64(1) << (_SCORE_FIELD_SHIFT - wp.uint64(id_bits))) - wp.uint64(1)
+
+
+@wp.func
+def _make_contact_value_det_bits(score: float, fingerprint: int, contact_id: int, id_bits: int) -> wp.uint64:
     """Pack score, fingerprint, and contact_id into a uint64 for ``atomic_max``.
 
     This packing enables **deterministic contact reduction**: multiple GPU
@@ -408,13 +423,13 @@ def _make_contact_value_det(score: float, fingerprint: int, contact_id: int) -> 
     """
     return (
         (wp.uint64(float_flip(score) >> wp.uint32(wp.static(SCORE_SHIFT))) << wp.uint64(42))
-        | ((wp.uint64(fingerprint) & FINGERPRINT_MASK) << CONTACT_ID_BITS)
-        | (wp.uint64(contact_id) & CONTACT_ID_MASK)
+        | ((wp.uint64(fingerprint) & _fingerprint_mask(id_bits)) << wp.uint64(id_bits))
+        | (wp.uint64(contact_id) & _contact_id_mask(id_bits))
     )
 
 
 @wp.func
-def _make_preprune_probe_det(score: float, fingerprint: int) -> wp.uint64:
+def _make_preprune_probe_det_bits(score: float, fingerprint: int, id_bits: int) -> wp.uint64:
     """Deterministic pre-prune probe for ``export_and_reduce_contact_centered``.
 
     Packs the score and fingerprint with ``CONTACT_ID_MASK`` (all 1s) in the
@@ -428,13 +443,15 @@ def _make_preprune_probe_det(score: float, fingerprint: int) -> wp.uint64:
     """
     return (
         (wp.uint64(float_flip(score) >> wp.uint32(wp.static(SCORE_SHIFT))) << wp.uint64(42))
-        | ((wp.uint64(fingerprint) & FINGERPRINT_MASK) << CONTACT_ID_BITS)
-        | CONTACT_ID_MASK
+        | ((wp.uint64(fingerprint) & _fingerprint_mask(id_bits)) << wp.uint64(id_bits))
+        | _contact_id_mask(id_bits)
     )
 
 
 @wp.func
-def _make_spatial_contact_value_det(score: float, is_inner: bool, fingerprint: int, contact_id: int) -> wp.uint64:
+def _make_spatial_contact_value_det_bits(
+    score: float, is_inner: bool, fingerprint: int, contact_id: int, id_bits: int
+) -> wp.uint64:
     """Pack inner/outer priority, spatial score, fingerprint, and contact id."""
     priority = wp.uint64(0)
     if is_inner:
@@ -443,13 +460,13 @@ def _make_spatial_contact_value_det(score: float, is_inner: bool, fingerprint: i
     return (
         (priority << wp.uint64(63))
         | (score_bits << wp.uint64(42))
-        | ((wp.uint64(fingerprint) & FINGERPRINT_MASK) << CONTACT_ID_BITS)
-        | (wp.uint64(contact_id) & CONTACT_ID_MASK)
+        | ((wp.uint64(fingerprint) & _fingerprint_mask(id_bits)) << wp.uint64(id_bits))
+        | (wp.uint64(contact_id) & _contact_id_mask(id_bits))
     )
 
 
 @wp.func
-def _make_spatial_preprune_probe_det(score: float, is_inner: bool, fingerprint: int) -> wp.uint64:
+def _make_spatial_preprune_probe_det_bits(score: float, is_inner: bool, fingerprint: int, id_bits: int) -> wp.uint64:
     """Deterministic pre-prune probe for prioritized spatial slots."""
     priority = wp.uint64(0)
     if is_inner:
@@ -458,9 +475,33 @@ def _make_spatial_preprune_probe_det(score: float, is_inner: bool, fingerprint: 
     return (
         (priority << wp.uint64(63))
         | (score_bits << wp.uint64(42))
-        | ((wp.uint64(fingerprint) & FINGERPRINT_MASK) << CONTACT_ID_BITS)
-        | CONTACT_ID_MASK
+        | ((wp.uint64(fingerprint) & _fingerprint_mask(id_bits)) << wp.uint64(id_bits))
+        | _contact_id_mask(id_bits)
     )
+
+
+@wp.func
+def _make_contact_value_det(score: float, fingerprint: int, contact_id: int) -> wp.uint64:
+    """:func:`_make_contact_value_det_bits` with the 20-bit contact_id layout."""
+    return _make_contact_value_det_bits(score, fingerprint, contact_id, 20)
+
+
+@wp.func
+def _make_preprune_probe_det(score: float, fingerprint: int) -> wp.uint64:
+    """:func:`_make_preprune_probe_det_bits` with the 20-bit contact_id layout."""
+    return _make_preprune_probe_det_bits(score, fingerprint, 20)
+
+
+@wp.func
+def _make_spatial_contact_value_det(score: float, is_inner: bool, fingerprint: int, contact_id: int) -> wp.uint64:
+    """:func:`_make_spatial_contact_value_det_bits` with the 20-bit contact_id layout."""
+    return _make_spatial_contact_value_det_bits(score, is_inner, fingerprint, contact_id, 20)
+
+
+@wp.func
+def _make_spatial_preprune_probe_det(score: float, is_inner: bool, fingerprint: int) -> wp.uint64:
+    """:func:`_make_spatial_preprune_probe_det_bits` with the 20-bit contact_id layout."""
+    return _make_spatial_preprune_probe_det_bits(score, is_inner, fingerprint, 20)
 
 
 @wp.func_native("""
@@ -471,10 +512,24 @@ def _unpack_contact_id_det(packed: wp.uint64) -> int:
     ...
 
 
+@wp.func
+def _unpack_contact_id_det_bits(packed: wp.uint64, id_bits: int) -> int:
+    """Extract contact_id (low ``id_bits`` bits) — deterministic variant of a widened reducer."""
+    return int(packed & _contact_id_mask(id_bits))
+
+
 # -- Per-reducer dispatching functions -------------------------------------
 # These functions dispatch between fast and deterministic variants based on
 # a ``deterministic`` flag, making the packing mode a per-reducer property
 # instead of process-global state.
+
+
+@wp.func
+def _det_id_bits(deterministic: int) -> int:
+    """Contact-id width of a deterministic reducer flag (1 is the original 20-bit layout)."""
+    if deterministic > 1:
+        return deterministic
+    return 20
 
 
 @wp.func
@@ -492,7 +547,7 @@ def make_contact_value(score: float, fingerprint: int, contact_id: int, determin
         deterministic: Non-zero to use deterministic packing.
     """
     if deterministic != 0:
-        return _make_contact_value_det(score, fingerprint, contact_id)
+        return _make_contact_value_det_bits(score, fingerprint, contact_id, _det_id_bits(deterministic))
     return _make_contact_value_fast(score, fingerprint, contact_id)
 
 
@@ -506,7 +561,7 @@ def make_spatial_contact_value(
 ) -> wp.uint64:
     """Pack a directional contact value where inner contacts outrank outer contacts."""
     if deterministic != 0:
-        return _make_spatial_contact_value_det(score, is_inner, fingerprint, contact_id)
+        return _make_spatial_contact_value_det_bits(score, is_inner, fingerprint, contact_id, _det_id_bits(deterministic))
     return _make_spatial_contact_value_fast(score, is_inner, fingerprint, contact_id)
 
 
@@ -514,7 +569,7 @@ def make_spatial_contact_value(
 def make_spatial_preprune_probe(score: float, is_inner: bool, fingerprint: int, deterministic: int) -> wp.uint64:
     """Build a pre-prune probe for prioritized directional slots."""
     if deterministic != 0:
-        return _make_spatial_preprune_probe_det(score, is_inner, fingerprint)
+        return _make_spatial_preprune_probe_det_bits(score, is_inner, fingerprint, _det_id_bits(deterministic))
     return _make_spatial_preprune_probe_fast(score, is_inner, fingerprint)
 
 
@@ -530,7 +585,7 @@ def unpack_contact_id(packed: wp.uint64, deterministic: int) -> int:
         deterministic: Non-zero to use deterministic unpacking.
     """
     if deterministic != 0:
-        return _unpack_contact_id_det(packed)
+        return _unpack_contact_id_det_bits(packed, _det_id_bits(deterministic))
     return _unpack_contact_id_fast(packed)
 
 
@@ -813,6 +868,7 @@ class GlobalContactReducer:
         store_moment_data: bool = False,
         deterministic: bool = False,
         hashtable_size_factor: float = 0.25,
+        max_contact_id_bits: int = 20,
     ):
         """Initialize the global contact reducer.
 
@@ -827,16 +883,22 @@ class GlobalContactReducer:
                 deterministic variant.
             hashtable_size_factor: Multiplier applied to ``capacity`` when sizing
                 the reduction hashtable. Must be positive.
+            max_contact_id_bits: Widest deterministic contact_id field allowed
+                (20 to ``MAX_CONTACT_ID_BITS``). A capacity above ``2**20``
+                widens the field to fit and narrows the fingerprint tiebreaker
+                by the same number of bits.
         """
         hashtable_size_factor = float(hashtable_size_factor)
         if not hashtable_size_factor > 0.0:
             raise ValueError(f"hashtable_size_factor must be > 0.0, got {hashtable_size_factor}")
 
-        max_det_contacts = 1 << int(CONTACT_ID_BITS)
+        max_contact_id_bits = min(max(int(max_contact_id_bits), int(CONTACT_ID_BITS)), MAX_CONTACT_ID_BITS)
+        self.contact_id_bits = max(int(CONTACT_ID_BITS), (max(int(capacity), 1) - 1).bit_length())
+        max_det_contacts = 1 << max_contact_id_bits
         if deterministic and capacity > max_det_contacts:
             raise ValueError(
                 f"Deterministic contact packing supports at most {max_det_contacts} "
-                f"buffered contacts ({int(CONTACT_ID_BITS)}-bit contact_id), "
+                f"buffered contacts ({max_contact_id_bits}-bit contact_id), "
                 f"but capacity={capacity}. Reduce max_triangle_pairs or disable "
                 f"deterministic mode."
             )
@@ -844,6 +906,9 @@ class GlobalContactReducer:
         self.device = device
         self.store_hydroelastic_data = store_hydroelastic_data
         self.deterministic = deterministic
+        # flag passed to the packing functions: 0 fast, 1 deterministic with the original 20-bit contact_id
+        # (which the hydroelastic unpacking assumes), or the widened contact_id width
+        self.packing_flag = (self.contact_id_bits if self.contact_id_bits > 20 else 1) if deterministic else 0
         self.hashtable_size_factor = hashtable_size_factor
 
         self.values_per_key = NUM_SPATIAL_DIRECTIONS + 1
@@ -1005,7 +1070,7 @@ class GlobalContactReducer:
         data.ht_insert_failures = self.ht_insert_failures
         data.ht_capacity = self.hashtable.capacity
         data.ht_values_per_key = self.values_per_key
-        data.deterministic = 1 if self.deterministic else 0
+        data.deterministic = self.packing_flag
         return data
 
 
@@ -1246,7 +1311,7 @@ def export_and_reduce_contact_centered(
 
     if entry_idx >= 0:
         if reducer_data.deterministic != 0:
-            max_depth_probe = _make_preprune_probe_det(-depth, fingerprint)
+            max_depth_probe = _make_preprune_probe_det_bits(-depth, fingerprint, _det_id_bits(reducer_data.deterministic))
         else:
             max_depth_probe = _make_contact_value_fast(-depth, 0, 0)
         if reducer_data.ht_values[wp.static(NUM_SPATIAL_DIRECTIONS) * ht_capacity + entry_idx] < max_depth_probe:
@@ -1258,7 +1323,7 @@ def export_and_reduce_contact_centered(
                     dir_2d = get_spatial_direction_2d(dir_i)
                     score = wp.dot(pos_2d, dir_2d)
                     if reducer_data.deterministic != 0:
-                        probe = _make_preprune_probe_det(score, fingerprint)
+                        probe = _make_preprune_probe_det_bits(score, fingerprint, _det_id_bits(reducer_data.deterministic))
                     else:
                         probe = _make_contact_value_fast(score, 0, 0)
                     if reducer_data.ht_values[dir_i * ht_capacity + entry_idx] < probe:
@@ -1280,7 +1345,7 @@ def export_and_reduce_contact_centered(
         voxel_entry_idx = hashtable_find_or_insert(voxel_key, reducer_data.ht_keys, reducer_data.ht_active_slots)
         if voxel_entry_idx >= 0:
             if reducer_data.deterministic != 0:
-                voxel_probe = _make_preprune_probe_det(-depth, fingerprint)
+                voxel_probe = _make_preprune_probe_det_bits(-depth, fingerprint, _det_id_bits(reducer_data.deterministic))
             else:
                 voxel_probe = _make_contact_value_fast(-depth, 0, 0)
             if reducer_data.ht_values[voxel_local_slot * ht_capacity + voxel_entry_idx] < voxel_probe:
@@ -1363,7 +1428,7 @@ def export_and_reduce_contact_centered_two_spatial_depths(
     if entry_idx >= 0:
         if use_inner:
             if reducer_data.deterministic != 0:
-                max_depth_probe = _make_preprune_probe_det(-depth, fingerprint)
+                max_depth_probe = _make_preprune_probe_det_bits(-depth, fingerprint, _det_id_bits(reducer_data.deterministic))
             else:
                 max_depth_probe = _make_contact_value_fast(-depth, 0, 0)
             if reducer_data.ht_values[wp.static(NUM_SPATIAL_DIRECTIONS) * ht_capacity + entry_idx] < max_depth_probe:
@@ -1395,7 +1460,7 @@ def export_and_reduce_contact_centered_two_spatial_depths(
         voxel_entry_idx = hashtable_find_or_insert(voxel_key, reducer_data.ht_keys, reducer_data.ht_active_slots)
         if voxel_entry_idx >= 0:
             if reducer_data.deterministic != 0:
-                voxel_probe = _make_preprune_probe_det(-depth, fingerprint)
+                voxel_probe = _make_preprune_probe_det_bits(-depth, fingerprint, _det_id_bits(reducer_data.deterministic))
             else:
                 voxel_probe = _make_contact_value_fast(-depth, 0, 0)
             if reducer_data.ht_values[voxel_local_slot * ht_capacity + voxel_entry_idx] < voxel_probe:

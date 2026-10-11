@@ -24,6 +24,8 @@ from newton._src.geometry.contact_reduction_global import (
     export_and_reduce_contact_centered,
     export_and_reduce_contact_centered_two_spatial_depths,
     make_contact_key,
+    make_contact_value,
+    unpack_contact_id,
 )
 from newton._src.geometry.narrow_phase import ContactWriterData
 from newton.tests.unittest_utils import add_function_test, get_test_devices
@@ -1217,6 +1219,53 @@ def test_det_pack_unpack_roundtrip(test, device):
         )
 
 
+@wp.kernel
+def _det_pack_unpack_flag_kernel(
+    flag: int,
+    scores: wp.array[float],
+    fingerprints: wp.array[int],
+    contact_ids: wp.array[int],
+    packed_out: wp.array[wp.uint64],
+    unpacked_ids_out: wp.array[int],
+):
+    tid = wp.tid()
+    packed = make_contact_value(scores[tid], fingerprints[tid], contact_ids[tid], flag)
+    packed_out[tid] = packed
+    unpacked_ids_out[tid] = unpack_contact_id(packed, flag)
+
+
+def test_det_wide_contact_ids(test, device):
+    """Widen the deterministic contact_id field for reducers with more than 2**20 contacts.
+
+    The score field is unchanged and the fingerprint loses the bits the contact_id gains, so a larger score still
+    wins and every contact_id below the capacity survives packing.
+    """
+    capacity = 3 * (1 << 20)
+    reducer = GlobalContactReducer(capacity, device=device, deterministic=True, max_contact_id_bits=24)
+    test.assertEqual(reducer.contact_id_bits, 22)
+    test.assertEqual(reducer.packing_flag, 22)
+    with test.assertRaisesRegex(ValueError, "at most"):
+        GlobalContactReducer(capacity, device=device, deterministic=True)
+    small = GlobalContactReducer(1 << 20, device=device, deterministic=True)
+    test.assertEqual(small.packing_flag, 1)
+
+    scores = wp.array([0.1, 0.5, 0.5, -0.01, 0.0], dtype=float, device=device)
+    fps = wp.array([7, 7, 8, 999, 0], dtype=int, device=device)
+    ids = wp.array([0, capacity - 1, 12345, 1 << 21, (1 << 20) + 3], dtype=int, device=device)
+    packed = wp.zeros(5, dtype=wp.uint64, device=device)
+    unpacked = wp.zeros(5, dtype=int, device=device)
+    wp.launch(
+        _det_pack_unpack_flag_kernel,
+        dim=5,
+        inputs=[reducer.packing_flag, scores, fps, ids, packed, unpacked],
+        device=device,
+    )
+    np.testing.assert_array_equal(unpacked.numpy(), ids.numpy())
+    packed_np = packed.numpy()
+    test.assertLess(packed_np[0], packed_np[1])  # score dominates
+    test.assertLess(packed_np[1], packed_np[2])  # then the fingerprint
+
+
 def test_det_packing_score_dominates(test, device):
     """Verify that higher score always produces a larger packed value."""
     n = 2
@@ -1458,6 +1507,7 @@ add_function_test(
 )
 
 # Deterministic packing tests
+add_function_test(TestDeterministicPacking, "test_det_wide_contact_ids", test_det_wide_contact_ids, devices=devices)
 add_function_test(
     TestDeterministicPacking, "test_det_pack_unpack_roundtrip", test_det_pack_unpack_roundtrip, devices=devices
 )

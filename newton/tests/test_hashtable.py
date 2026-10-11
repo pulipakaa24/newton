@@ -9,7 +9,7 @@ import numpy as np
 import warp as wp
 
 from newton._src.geometry.contact_reduction_global import GlobalContactReducer, reduction_insert_slot
-from newton._src.geometry.hashtable import HashTable
+from newton._src.geometry.hashtable import HashTable, hashtable_find_or_insert
 from newton.tests.unittest_utils import add_function_test, get_test_devices
 
 # =============================================================================
@@ -299,6 +299,47 @@ def test_high_collision(test, device):
     test.assertEqual(active_count, 10)
 
 
+@wp.kernel
+def _find_or_insert_kernel(
+    keys_in: wp.array[wp.uint64],
+    keys: wp.array[wp.uint64],
+    active_slots: wp.array[wp.int32],
+    entry_out: wp.array[int],
+):
+    tid = wp.tid()
+    entry_out[tid] = hashtable_find_or_insert(keys_in[tid], keys, active_slots)
+
+
+def test_concurrent_distinct_keys(test, device):
+    """Map every key to one slot holding it when many threads insert colliding keys at once.
+
+    Thousands of distinct 63-bit keys, each inserted by several threads, into a table only twice their number:
+    linear probing makes threads with different keys race for the same empty slots, which needs an atomic
+    64-bit claim (emulated on Metal, which has no 64-bit compare-and-swap).
+    """
+    rng = np.random.default_rng(7)
+    for n, m in ((4096, 64), (32768, 4096), (262144, 8192)):
+        pool = np.unique(rng.integers(1, 2**62, size=m, dtype=np.uint64))
+        keys_np = pool[rng.integers(0, len(pool), size=n)]
+        unique = np.unique(keys_np)
+        ht = HashTable(capacity=2 * len(unique), device=device)
+        keys_in = wp.array(keys_np, dtype=wp.uint64, device=device)
+        entry = wp.zeros(n, dtype=int, device=device)
+        wp.launch(_find_or_insert_kernel, dim=n, inputs=[keys_in, ht.keys, ht.active_slots, entry], device=device)
+
+        table = ht.keys.numpy()
+        entry_np = entry.numpy()
+        test.assertTrue(np.all(entry_np >= 0))
+        np.testing.assert_array_equal(table[entry_np], keys_np)
+        stored = table[table != np.uint64(0xFFFFFFFFFFFFFFFF)]
+        test.assertEqual(len(stored), len(unique))
+        test.assertEqual(len(np.unique(stored)), len(unique))
+        active = ht.active_slots.numpy()
+        count = int(active[ht.capacity])
+        test.assertEqual(count, len(unique))
+        np.testing.assert_array_equal(np.sort(table[active[:count]]), np.sort(unique))
+
+
 def test_early_exit_optimization(test, device):
     """Test that the early exit optimization works correctly.
 
@@ -361,6 +402,7 @@ add_function_test(TestHashTable, "test_multiple_keys", test_multiple_keys, devic
 add_function_test(TestHashTable, "test_clear", test_clear, devices=devices)
 add_function_test(TestHashTable, "test_clear_active", test_clear_active, devices=devices)
 add_function_test(TestHashTable, "test_high_collision", test_high_collision, devices=devices)
+add_function_test(TestHashTable, "test_concurrent_distinct_keys", test_concurrent_distinct_keys, devices=devices)
 add_function_test(TestHashTable, "test_early_exit_optimization", test_early_exit_optimization, devices=devices)
 
 

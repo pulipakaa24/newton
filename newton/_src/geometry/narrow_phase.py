@@ -34,6 +34,7 @@ from ..geometry.collision_primitive import (
 from ..geometry.contact_data import SHAPE_PAIR_HFIELD_BIT, ContactData, contact_passes_gap_check, make_contact_sort_key
 from ..geometry.contact_reduction_global import (
     HASHTABLE_WARN_LOAD_PERCENT,
+    MAX_CONTACT_ID_BITS,
     GlobalContactReducer,
     create_export_reduced_contacts_kernel,
     mesh_triangle_contacts_to_reducer_kernel,
@@ -1657,6 +1658,7 @@ class NarrowPhase:
                 device=device,
                 deterministic=deterministic,
                 hashtable_size_factor=contact_reduction_hashtable_size_factor,
+                max_contact_id_bits=MAX_CONTACT_ID_BITS,
             )
         else:
             self.export_reduced_contacts_kernel = None
@@ -2179,7 +2181,7 @@ class NarrowPhase:
                         shape_gap,
                         writer_data,
                         self.total_num_threads,
-                        int(self.global_contact_reducer.deterministic),
+                        self.global_contact_reducer.packing_flag,
                     ],
                     device=device,
                     block_dim=self.block_dim,
