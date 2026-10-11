@@ -103,6 +103,113 @@ def hashtable_find(
     return -1
 
 
+# Metal has no 64-bit compare-and-swap (Apple GPUs offer only 64-bit atomic min/max, without a return
+# value), and Warp lowers a 64-bit ``wp.atomic_cas`` there to a plain read-modify-write. Concurrent
+# inserts then claim the same slot, overwrite each other's keys and append the slot to the active list
+# more than once. On Metal the table therefore claims a slot with a 32-bit compare-and-swap on the key's
+# high word (EMPTY -> _HASHTABLE_CLAIMED_HI) and then publishes the whole key with one 64-bit atomic min
+# (the claimed word compares greater than every valid key). Readers inside the insert kernel see an
+# empty, a claimed (in flight) or a settled slot; a claimed slot is re-read on the next pass of a loop
+# that every lane of a SIMD-group runs, so the claimant (possibly a lane of the same SIMD-group)
+# finishes publishing first. Valid keys must keep bit 63 clear (every Newton key does: contact keys use
+# 63 bits, Morton voxel keys 63 bits); other keys fall back to the plain update.
+_HASHTABLE_CLAIMED_HI = wp.constant(wp.uint32(0x80000000))
+_HASHTABLE_EMPTY_HI = wp.constant(wp.uint32(0xFFFFFFFF))
+
+
+@wp.func_native("""
+#if defined(__METAL_VERSION__)
+return true;
+#else
+return false;
+#endif
+""")
+def _hashtable_use_claims() -> bool:
+    """True when compiled for Metal (see _HASHTABLE_CLAIMED_HI)."""
+    ...
+
+
+@wp.func_native("""
+#if defined(__METAL_VERSION__)
+device metal::atomic_uint* word = (device metal::atomic_uint*)(keys.data + idx) + 1;
+return metal::atomic_load_explicit(word, metal::memory_order_relaxed);
+#else
+return static_cast<uint32_t>(keys.data[idx] >> 32);
+#endif
+""")
+def _hashtable_load_hi(keys: wp.array[wp.uint64], idx: int) -> wp.uint32:
+    """Atomically read the high word of a key slot."""
+    ...
+
+
+@wp.func_native("""
+#if defined(__METAL_VERSION__)
+device metal::atomic_uint* word = (device metal::atomic_uint*)(keys.data + idx);
+const uint64_t lo = metal::atomic_load_explicit(word, metal::memory_order_relaxed);
+const uint64_t hi = metal::atomic_load_explicit(word + 1, metal::memory_order_relaxed);
+return (hi << 32) | lo;
+#else
+return keys.data[idx];
+#endif
+""")
+def _hashtable_load_key(keys: wp.array[wp.uint64], idx: int) -> wp.uint64:
+    """Atomically read a settled key slot (both words are final once the high word is)."""
+    ...
+
+
+@wp.func_native("""
+#if defined(__METAL_VERSION__)
+device metal::atomic_uint* word = (device metal::atomic_uint*)(keys.data + idx) + 1;
+uint expected = 0xFFFFFFFFu;
+return metal::atomic_compare_exchange_weak_explicit(
+    word, &expected, 0x80000000u, metal::memory_order_relaxed, metal::memory_order_relaxed);
+#else
+return false;
+#endif
+""")
+def _hashtable_claim(keys: wp.array[wp.uint64], idx: int) -> bool:
+    """Claim an empty slot: high word EMPTY -> _HASHTABLE_CLAIMED_HI (may fail spuriously; callers retry)."""
+    ...
+
+
+@wp.func
+def _hashtable_find_or_insert_claimed(
+    key: wp.uint64,
+    keys: wp.array[wp.uint64],
+    active_slots: wp.array[wp.int32],
+) -> int:
+    """``hashtable_find_or_insert`` for Metal (see _HASHTABLE_CLAIMED_HI)."""
+    capacity = keys.shape[0]
+    capacity_mask = capacity - 1
+    idx = _hashtable_hash(key, capacity_mask)
+    probes = int(0)
+    result = int(-1)
+    pending = bool(True)
+    while pending:
+        hi = _hashtable_load_hi(keys, idx)
+        if hi == _HASHTABLE_EMPTY_HI:
+            if _hashtable_claim(keys, idx):
+                # the slot reads (CLAIMED, EMPTY_LO) > key, so the min writes the whole key in one atomic
+                wp.atomic_min(keys, idx, key)
+                active_idx = wp.atomic_add(active_slots, capacity, 1)
+                if active_idx < capacity:
+                    active_slots[active_idx] = idx
+                result = idx
+                pending = False
+            # lost the claim (or failed spuriously): look at the same slot again
+        elif hi != _HASHTABLE_CLAIMED_HI:
+            if _hashtable_load_key(keys, idx) == key:
+                result = idx
+                pending = False
+            else:
+                idx = (idx + 1) & capacity_mask
+                probes += 1
+                if probes >= capacity:
+                    pending = False
+        # else: another thread is publishing its key in this slot; look again
+    return result
+
+
 @wp.func
 def hashtable_find_or_insert(
     key: wp.uint64,
@@ -123,6 +230,9 @@ def hashtable_find_or_insert(
     Returns:
         Entry index (>= 0) if successful, -1 if the table is full
     """
+    if _hashtable_use_claims() and (key >> wp.uint64(63)) == wp.uint64(0):
+        return _hashtable_find_or_insert_claimed(key, keys, active_slots)
+
     capacity = keys.shape[0]
     capacity_mask = capacity - 1
     idx = _hashtable_hash(key, capacity_mask)
