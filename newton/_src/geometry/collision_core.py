@@ -938,39 +938,23 @@ def transform_normal_with_scale(
 
 
 @wp.func
-def mesh_vs_convex_midphase(
-    idx_in_thread_block: int,
+def mesh_vs_convex_query_aabb(
     mesh_shape: int,
     non_mesh_shape: int,
     X_mesh_ws: wp.transform,
     X_ws: wp.transform,
-    mesh_id: wp.uint64,
     shape_type: wp.array[int],
     shape_data: wp.array[wp.vec4],
     shape_source_ptr: wp.array[wp.uint64],
     contact_threshold: float,
-    triangle_pairs: wp.array[wp.vec3i],
-    triangle_pairs_count: wp.array[int],
 ):
-    """
-    Perform mesh vs convex shape midphase collision detection.
+    """Query box of the mesh-vs-convex midphase, in the mesh's unscaled (BVH) frame.
 
-    This function finds all mesh triangles that overlap with the convex shape's AABB
-    by querying the mesh BVH. The results are output as triangle pairs for further
-    narrow-phase collision detection.
+    The convex shape's tight AABB in the mesh frame, grown by ``contact_threshold``
+    [m] (converted per axis to unscaled mesh units).
 
-    Args:
-        mesh_shape: Index of the mesh shape
-        non_mesh_shape: Index of the non-mesh (convex) shape
-        X_mesh_ws: Mesh world-space transform
-        X_ws: Non-mesh shape world-space transform
-        mesh_id: Mesh BVH ID
-        shape_type: Array of shape types
-        shape_data: Array of shape data (vec4: scale.xyz, margin.w)
-        shape_source_ptr: Array of mesh/SDF source pointers
-        contact_threshold: Contact candidate distance [m], including margin and gap
-        triangle_pairs: Output array for triangle pairs (mesh_shape, non_mesh_shape, tri_index)
-        triangle_pairs_count: Counter for triangle pairs
+    Returns:
+        ``(lower, upper)`` corners of the query box.
     """
     # Get inverse mesh transform (world to mesh local space)
     X_mesh_sw = wp.transform_inverse(X_mesh_ws)
@@ -1024,6 +1008,54 @@ def mesh_vs_convex_midphase(
     )
     aabb_lower = aabb_lower_bvh - margin_vec
     aabb_upper = aabb_upper_bvh + margin_vec
+    return aabb_lower, aabb_upper
+
+
+@wp.func
+def mesh_vs_convex_midphase(
+    idx_in_thread_block: int,
+    mesh_shape: int,
+    non_mesh_shape: int,
+    X_mesh_ws: wp.transform,
+    X_ws: wp.transform,
+    mesh_id: wp.uint64,
+    shape_type: wp.array[int],
+    shape_data: wp.array[wp.vec4],
+    shape_source_ptr: wp.array[wp.uint64],
+    contact_threshold: float,
+    triangle_pairs: wp.array[wp.vec3i],
+    triangle_pairs_count: wp.array[int],
+):
+    """
+    Perform mesh vs convex shape midphase collision detection.
+
+    This function finds all mesh triangles that overlap with the convex shape's AABB
+    by querying the mesh BVH. The results are output as triangle pairs for further
+    narrow-phase collision detection.
+
+    Args:
+        mesh_shape: Index of the mesh shape
+        non_mesh_shape: Index of the non-mesh (convex) shape
+        X_mesh_ws: Mesh world-space transform
+        X_ws: Non-mesh shape world-space transform
+        mesh_id: Mesh BVH ID
+        shape_type: Array of shape types
+        shape_data: Array of shape data (vec4: scale.xyz, margin.w)
+        shape_source_ptr: Array of mesh/SDF source pointers
+        contact_threshold: Contact candidate distance [m], including margin and gap
+        triangle_pairs: Output array for triangle pairs (mesh_shape, non_mesh_shape, tri_index)
+        triangle_pairs_count: Counter for triangle pairs
+    """
+    aabb_lower, aabb_upper = mesh_vs_convex_query_aabb(
+        mesh_shape,
+        non_mesh_shape,
+        X_mesh_ws,
+        X_ws,
+        shape_type,
+        shape_data,
+        shape_source_ptr,
+        contact_threshold,
+    )
 
     if wp.static(ENABLE_TILE_BVH_QUERY):
         # Query mesh BVH for overlapping triangles in mesh local space using tiled version
@@ -1060,6 +1092,46 @@ def mesh_vs_convex_midphase(
                 out_idx = wp.atomic_add(triangle_pairs_count, 0, 1)
                 if out_idx < triangle_pairs.shape[0]:
                     triangle_pairs[out_idx] = wp.vec3i(mesh_shape, non_mesh_shape, tri_index)
+
+
+@wp.func
+def mesh_vs_convex_midphase_thread(
+    mesh_shape: int,
+    non_mesh_shape: int,
+    X_mesh_ws: wp.transform,
+    X_ws: wp.transform,
+    mesh_id: wp.uint64,
+    shape_type: wp.array[int],
+    shape_data: wp.array[wp.vec4],
+    shape_source_ptr: wp.array[wp.uint64],
+    contact_threshold: float,
+    triangle_pairs: wp.array[wp.vec3i],
+    triangle_pairs_count: wp.array[int],
+):
+    """:func:`mesh_vs_convex_midphase` for one thread per pair (no thread-block BVH query).
+
+    Same query box and the same triangles, emitted in BVH traversal order. Used where
+    ``wp.tile_mesh_query_aabb`` has no cooperative implementation (Metal: there every
+    thread of the block repeats the whole traversal and one triangle is emitted per
+    block-wide step).
+    """
+    aabb_lower, aabb_upper = mesh_vs_convex_query_aabb(
+        mesh_shape,
+        non_mesh_shape,
+        X_mesh_ws,
+        X_ws,
+        shape_type,
+        shape_data,
+        shape_source_ptr,
+        contact_threshold,
+    )
+    query = wp.mesh_query_aabb(mesh_id, aabb_lower, aabb_upper)
+    tri_index = wp.int32(0)
+    while wp.mesh_query_aabb_next(query, tri_index):
+        if tri_index >= 0:
+            out_idx = wp.atomic_add(triangle_pairs_count, 0, 1)
+            if out_idx < triangle_pairs.shape[0]:
+                triangle_pairs[out_idx] = wp.vec3i(mesh_shape, non_mesh_shape, tri_index)
 
 
 @wp.func
