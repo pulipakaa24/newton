@@ -32,7 +32,14 @@ from .rasterized_collisions import (
     rasterize_collider,
 )
 from .render_grains import sample_render_grains, update_render_grains
-from .solve_rheology import CollisionData, MomentumData, RheologyData, YieldParamVec, solve_rheology
+from .solve_rheology import (
+    CollisionData,
+    MomentumData,
+    RheologyData,
+    YieldParamVec,
+    active_node_bound,
+    solve_rheology,
+)
 
 __all__ = ["SolverImplicitMPM"]
 
@@ -3124,6 +3131,9 @@ class SolverImplicitMPM(SolverBase, CouplingInterface):
             momentum_data = MomentumData(
                 inv_volume=scratch.inv_mass_matrix,
                 velocity=scratch.velocity_field.dof_values,
+                node_bound=active_node_bound(scratch.velocity_environment_offsets)
+                if self._sparse_rebuildable
+                else None,
             )
             rheology_data = RheologyData(
                 strain_mat=scratch.strain_matrix,
@@ -3141,6 +3151,7 @@ class SolverImplicitMPM(SolverBase, CouplingInterface):
                 has_viscosity=self._mpm_model.has_viscosity,
                 has_dilatancy=self._mpm_model.has_dilatancy,
                 strain_velocity_node_count=-1 if self._separate_worlds else self._velocity_nodes_per_strain_sample,
+                node_bound=active_node_bound(scratch.strain_environment_offsets) if self._sparse_rebuildable else None,
             )
             collision_data = CollisionData(
                 collider_mat=scratch.collider_matrix,
