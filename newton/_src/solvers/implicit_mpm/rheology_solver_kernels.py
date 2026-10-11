@@ -975,6 +975,16 @@ def make_jacobi_solve_kernel(
     return jacobi_solve_kernel_impl
 
 
+# Gauss-Seidel color passes are short kernels dispatched thousands of times per frame (one per color and solver
+# iteration): on Metal, reading their arguments from device instead of constant memory skips the per-dispatch
+# preload of the argument block (17 arrays), which is most of their cost there (MetalSim's Warp fork, module option
+# "metal_device_args": Newton MPM granular 39.5 -> 34.1 ms per frame, bitwise the same). Other Warp builds do not
+# know the option and keep their defaults.
+_GS_KERNEL_OPTIONS = {"fast_math": True}
+if "metal_device_args" in wp.get_module(__name__).options:
+    _GS_KERNEL_OPTIONS["metal_device_args"] = True
+
+
 def make_gs_solve_kernel(
     has_viscosity: bool,
     has_dilatancy: bool,
@@ -991,7 +1001,7 @@ def make_gs_solve_kernel(
     """
     key = (has_viscosity, has_dilatancy, has_compliance_mat, has_rotation, strain_velocity_node_count)
 
-    @fem.cache.dynamic_kernel(suffix=key, kernel_options={"fast_math": True})
+    @fem.cache.dynamic_kernel(suffix=key, kernel_options=_GS_KERNEL_OPTIONS)
     def gs_solve_kernel_impl(
         color: int,
         launch_dim: int,
@@ -1161,7 +1171,7 @@ def make_reordered_gs_solve_kernel(
     """
     key = (has_viscosity, has_dilatancy, has_compliance_mat, has_rotation, max_entries)
 
-    @fem.cache.dynamic_kernel(suffix=key, kernel_options={"fast_math": True})
+    @fem.cache.dynamic_kernel(suffix=key, kernel_options=_GS_KERNEL_OPTIONS)
     def reordered_gs_solve_kernel_impl(
         color: int,
         launch_dim: int,
