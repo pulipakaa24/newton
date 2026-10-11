@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import gc
+import inspect
 import math
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -57,6 +58,30 @@ from .rheology_solver_kernels import (
 
 _TILED_SUM_BLOCK_DIM = 512
 _STRESS_DOF_COUNT = 6
+
+# Warp builds whose wp.launch takes a device-side launch bound (``dim_limit``; the MetalSim fork) run kernels over
+# fixed-capacity node arrays only up to the active prefix on Metal; elsewhere the full capacity runs, as before.
+_LAUNCH_HAS_DIM_LIMIT = "dim_limit" in inspect.signature(wp.launch).parameters
+_AXPY_HAS_DIM_LIMIT = "dim_limit" in inspect.signature(array_axpy).parameters
+
+
+def active_node_bound(environment_offsets: wp.array | None) -> wp.array | None:
+    """Device view of the active-node count of an environment-first, fixed-capacity space partition.
+
+    ``environment_offsets[-1]`` is the length of the active prefix: nodes past it belong to no environment and no
+    active cell, matrix row or column references them, so kernels over the node capacity may skip them. Returns
+    ``None`` (full launches) unless the device is Metal and Warp supports bounded launches.
+    """
+    if environment_offsets is None or not _LAUNCH_HAS_DIM_LIMIT:
+        return None
+    if not getattr(environment_offsets.device, "is_metal", False):
+        return None
+    return environment_offsets[environment_offsets.shape[0] - 1 :]
+
+
+def _bounded(dim_limit: wp.array | None) -> dict:
+    """``wp.launch`` keyword arguments for an optional device-side launch bound."""
+    return {} if dim_limit is None else {"dim_limit": dim_limit}
 
 
 @wp.kernel
@@ -344,6 +369,9 @@ class MomentumData:
 
     inv_volume: wp.array
     velocity: wp.array[wp.vec3]
+    node_bound: wp.array[int] | None = None
+    """Device-side count of active velocity nodes (a 1-element view, see :func:`active_node_bound`): kernels over
+    the node capacity may skip the nodes past it. ``None``: every node is processed."""
 
 
 @dataclass
@@ -395,6 +423,9 @@ class RheologyData:
     has_viscosity: bool = False
     has_dilatancy: bool = False
     strain_velocity_node_count: int = -1
+
+    node_bound: wp.array[int] | None = None
+    """Device-side count of active strain nodes, see :attr:`MomentumData.node_bound`."""
 
 
 @dataclass
@@ -503,6 +534,7 @@ class _DelassusOperator:
                     1,
                 ],
                 outputs=[mult],
+                **_bounded(self.momentum.node_bound),
             )
         else:
             # GS mode: empty arrays → multiplicity of 1
@@ -513,6 +545,7 @@ class _DelassusOperator:
         wp.launch(
             kernel=compute_delassus_diagonal,
             dim=self.size,
+            **_bounded(self.rheology.node_bound),
             inputs=[
                 self.rheology.strain_mat.offsets,
                 self.rheology.strain_mat.columns,
@@ -544,6 +577,7 @@ class _DelassusOperator:
         wp.launch(
             kernel=preprocess_stress_and_strain,
             dim=self.size,
+            **_bounded(self.rheology.node_bound),
             inputs=[
                 self.rheology.unilateral_strain_offset,
                 self.rheology.elastic_strain_delta,
@@ -564,6 +598,7 @@ class _DelassusOperator:
         return wp.launch(
             kernel=apply_stress_delta_jacobi,
             dim=self.momentum.velocity.shape[0],
+            **_bounded(self.momentum.node_bound),
             inputs=[
                 self.rheology.transposed_strain_mat.offsets,
                 self.rheology.transposed_strain_mat.columns,
@@ -608,6 +643,7 @@ class _DelassusOperator:
         wp.launch(
             kernel=postprocess_stress_and_strain,
             dim=self.size,
+            **_bounded(self.rheology.node_bound),
             inputs=[
                 self.rheology.compliance_mat.offsets,
                 self.rheology.compliance_mat.columns,
@@ -656,6 +692,7 @@ class _RheologySolver:
         self._evaluate_strain_residual_launch = wp.launch(
             kernel=evaluate_strain_residual,
             dim=self.size,
+            **_bounded(self.rheology.node_bound),
             inputs=[
                 self.delta_stress,
                 self.delassus_operator.delassus_diagonal,
@@ -1339,6 +1376,7 @@ class _JacobiSolver(_RheologySolver):
         self.solve_local_launch = wp.launch(
             kernel=jacobi_kernel,
             dim=self.size,
+            **_bounded(self.rheology.node_bound),
             inputs=[
                 self.rheology.yield_params,
                 self.rheology.strain_node_volume,
@@ -1377,7 +1415,11 @@ class _JacobiSolver(_RheologySolver):
         self.solve_local_launch.launch()
         # Add jacobi delta
         self.apply_stress_launch.launch()
-        array_axpy(x=self.delta_stress, y=self.rheology.stress, alpha=1.0, beta=1.0)
+        bound = self.rheology.node_bound
+        if bound is not None and _AXPY_HAS_DIM_LIMIT:
+            array_axpy(x=self.delta_stress, y=self.rheology.stress, alpha=1.0, beta=1.0, dim_limit=bound)
+        else:
+            array_axpy(x=self.delta_stress, y=self.rheology.stress, alpha=1.0, beta=1.0)
 
 
 _ITERATIVE_LINEAR_SOLVERS = {
@@ -1718,6 +1760,7 @@ class _SubgridContactSolver(_ContactSolver):
         self.apply_collider_impulse_launch = wp.launch(
             apply_subgrid_impulse,
             dim=self.momentum.velocity.shape[0],
+            **_bounded(self.momentum.node_bound),
             inputs=[
                 self.collision.transposed_collider_mat.offsets,
                 self.collision.transposed_collider_mat.columns,

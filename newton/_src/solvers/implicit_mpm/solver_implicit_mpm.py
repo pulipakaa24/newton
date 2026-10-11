@@ -9,7 +9,7 @@ import operator
 from collections.abc import Sequence
 from dataclasses import dataclass
 from itertools import pairwise
-from typing import Literal
+from typing import Any, Literal
 
 import numpy as np
 import warp as wp
@@ -32,7 +32,14 @@ from .rasterized_collisions import (
     rasterize_collider,
 )
 from .render_grains import sample_render_grains, update_render_grains
-from .solve_rheology import CollisionData, MomentumData, RheologyData, YieldParamVec, solve_rheology
+from .solve_rheology import (
+    CollisionData,
+    MomentumData,
+    RheologyData,
+    YieldParamVec,
+    active_node_bound,
+    solve_rheology,
+)
 
 __all__ = ["SolverImplicitMPM"]
 
@@ -1216,6 +1223,11 @@ class SolverImplicitMPM(SolverBase, CouplingInterface):
         self._grid_status = None
         self._grid_accumulated_status = None
         self._grid_point_mask = None
+        # Proxy wrench harvest (coupled solvers): Metal's float atomics add in a different order on every run, so
+        # there the wrenches are summed in a fixed order instead (_harvest_proxy_wrenches_ordered).
+        self._ordered_proxy_harvest = bool(getattr(model.device, "is_metal", False))
+        self._proxy_harvest_partial = None
+        self._empty_int = None
         self.solver = _resolve_solver_spec(config.solver, self.velocity_basis)
         self.coloring = any("gauss-seidel" in solver or "gs" in solver for solver in self.solver)
         self.apic = config.transfer_scheme == "apic"
@@ -1792,6 +1804,12 @@ class SolverImplicitMPM(SolverBase, CouplingInterface):
             return
         body_q = state.body_q if state.body_q is not None else self.model.body_q
 
+        if self._ordered_proxy_harvest:
+            self._harvest_proxy_wrenches_ordered(
+                float(dt), body_local_to_proxy_global, impulses, positions, collider_ids, body_q, out_body_f
+            )
+            return
+
         wp.launch(
             _harvest_mpm_proxy_wrenches_kernel,
             dim=collider_ids.shape[0],
@@ -1810,6 +1828,78 @@ class SolverImplicitMPM(SolverBase, CouplingInterface):
             ],
             device=self.model.device,
         )
+
+    def _harvest_proxy_wrenches_ordered(
+        self,
+        dt: float,
+        body_local_to_proxy_global: wp.array[int],
+        impulses: wp.array[wp.vec3],
+        positions: wp.array[wp.vec3],
+        collider_ids: wp.array[int],
+        body_q: wp.array[wp.transform],
+        out_body_f: wp.array[wp.spatial_vector],
+    ) -> None:
+        """Proxy wrenches summed in a fixed order, without float atomics.
+
+        Each proxy body sums only the collider nodes of its own world (collider nodes are environment-first with
+        separate worlds), split over ``_HARVEST_LANES`` lanes that each add their nodes in node order; the lanes
+        are then added in lane order. Work is ``O(nodes x proxy bodies per world)`` and the result is the same on
+        every run, whatever the order in which the GPU schedules the lanes.
+        """
+        body_count = body_local_to_proxy_global.shape[0]
+        if body_count == 0:
+            return
+        if (
+            self._proxy_harvest_partial is None
+            or self._proxy_harvest_partial.shape[0] != body_count
+            or self._proxy_harvest_partial.device != out_body_f.device
+        ):
+            self._proxy_harvest_partial = wp.empty(
+                (body_count, _HARVEST_LANES), dtype=wp.spatial_vector, device=out_body_f.device
+            )
+        offsets = None
+        if self._separate_worlds and self._scratchpad is not None:
+            offsets = self._scratchpad.collider_environment_offsets
+        if offsets is None:
+            offsets = self._empty_int_array(out_body_f.device)
+        body_world = self.model.body_world
+        if body_world is None or body_world.shape[0] < body_count:
+            offsets = self._empty_int_array(out_body_f.device)  # no world ranges: every body sees every node
+            body_world = wp.full(body_count, -1, dtype=wp.int32, device=out_body_f.device)
+        proxy_flag = int(newton.BodyFlags.PROXY)
+        wp.launch(
+            _harvest_mpm_proxy_wrench_lanes_kernel,
+            dim=(body_count, _HARVEST_LANES),
+            inputs=[
+                dt,
+                _HARVEST_LANES,
+                offsets,
+                collider_ids,
+                impulses,
+                positions,
+                self.collider_body_index,
+                body_local_to_proxy_global,
+                proxy_flag,
+                self.model.body_flags,
+                body_world,
+                self.model.body_com,
+                body_q,
+                self._proxy_harvest_partial,
+            ],
+            device=out_body_f.device,
+        )
+        wp.launch(
+            _sum_mpm_proxy_wrench_lanes_kernel,
+            dim=body_count,
+            inputs=[self._proxy_harvest_partial, body_local_to_proxy_global, proxy_flag, self.model.body_flags],
+            outputs=[out_body_f],
+            device=out_body_f.device,
+        )
+
+    def _empty_int_array(self, device) -> wp.array:
+        if self._empty_int is None or self._empty_int.device != device:
+            self._empty_int = wp.empty(0, dtype=int, device=device)
+        return self._empty_int
 
     def coupling_rewind_proxy_particle(
         self,
@@ -3124,6 +3214,9 @@ class SolverImplicitMPM(SolverBase, CouplingInterface):
             momentum_data = MomentumData(
                 inv_volume=scratch.inv_mass_matrix,
                 velocity=scratch.velocity_field.dof_values,
+                node_bound=active_node_bound(scratch.velocity_environment_offsets)
+                if self._sparse_rebuildable
+                else None,
             )
             rheology_data = RheologyData(
                 strain_mat=scratch.strain_matrix,
@@ -3141,6 +3234,7 @@ class SolverImplicitMPM(SolverBase, CouplingInterface):
                 has_viscosity=self._mpm_model.has_viscosity,
                 has_dilatancy=self._mpm_model.has_dilatancy,
                 strain_velocity_node_count=-1 if self._separate_worlds else self._velocity_nodes_per_strain_sample,
+                node_bound=active_node_bound(scratch.strain_environment_offsets) if self._sparse_rebuildable else None,
             )
             collision_data = CollisionData(
                 collider_mat=scratch.collider_matrix,
@@ -3343,7 +3437,9 @@ class SolverImplicitMPM(SolverBase, CouplingInterface):
 
         if isinstance(prev_impulse_field.space.basis, fem.PointBasisSpace):
             # point-based collisions, simply copy the previous impulses
-            scratch.impulse_field.dof_values.assign(prev_impulse_field.dof_values[pic.cell_particle_indices])
+            _gather_point_dof_values(
+                pic.cell_particle_indices, prev_impulse_field.dof_values, scratch.impulse_field.dof_values
+            )
         elif grid_to_grid_warmstart:
             # Interpolate previous impulse
             prev_impulse_field = fem.NonconformingField(
@@ -3361,7 +3457,9 @@ class SolverImplicitMPM(SolverBase, CouplingInterface):
 
         # Interpolate previous stress
         if isinstance(prev_stress_field.space.basis, fem.PointBasisSpace):
-            scratch.stress_field.dof_values.assign(prev_stress_field.dof_values[pic.cell_particle_indices])
+            _gather_point_dof_values(
+                pic.cell_particle_indices, prev_stress_field.dof_values, scratch.stress_field.dof_values
+            )
         elif self._stress_warmstart in ("grid", "smoothed") and grid_to_grid_warmstart:
             prev_stress_field = fem.NonconformingField(
                 domain, prev_stress_field, background=scratch.background_stress_field
@@ -3387,8 +3485,10 @@ class SolverImplicitMPM(SolverBase, CouplingInterface):
 
             if isinstance(last_step_data.ws_impulse_field.space.basis, fem.PointBasisSpace):
                 # point-based collisions, simply copy the previous impulses
-                last_step_data.ws_impulse_field.dof_values[pic.cell_particle_indices].assign(
-                    scratch.impulse_field.dof_values
+                _scatter_point_dof_values(
+                    pic.cell_particle_indices,
+                    scratch.impulse_field.dof_values,
+                    last_step_data.ws_impulse_field.dof_values,
                 )
             else:
                 last_step_data.ws_impulse_field.dof_values.zero_()
@@ -3404,8 +3504,10 @@ class SolverImplicitMPM(SolverBase, CouplingInterface):
 
             last_step_data.rebind_strain_space_fields(scratch, smoothed=self._stress_warmstart == "smoothed")
             if isinstance(last_step_data.ws_stress_field.space.basis, fem.PointBasisSpace):
-                last_step_data.ws_stress_field.dof_values[pic.cell_particle_indices].assign(
-                    scratch.stress_field.dof_values
+                _scatter_point_dof_values(
+                    pic.cell_particle_indices,
+                    scratch.stress_field.dof_values,
+                    last_step_data.ws_stress_field.dof_values,
                 )
             else:
                 last_step_data.ws_stress_field.dof_values.zero_()
@@ -3729,3 +3831,107 @@ def _harvest_mpm_proxy_wrenches_kernel(
     center = wp.transform_point(body_q[local_body], body_com[local_body])
     r = collider_impulse_pos[i] - center
     wp.atomic_add(out_body_f, proxy_global, wp.spatial_vector(f_world, wp.cross(r, f_world)))
+
+
+@wp.kernel(enable_backward=False)
+def _gather_point_dof_values_kernel(indices: wp.array[int], src: wp.array[Any], dst: wp.array[Any]):
+    i = wp.tid()
+    j = indices[i]
+    if j >= 0 and j < src.shape[0]:
+        dst[i] = src[j]
+    else:
+        dst[i] = dst.dtype()
+
+
+@wp.kernel(enable_backward=False)
+def _scatter_point_dof_values_kernel(indices: wp.array[int], src: wp.array[Any], dst: wp.array[Any]):
+    i = wp.tid()
+    j = indices[i]
+    if j >= 0 and j < dst.shape[0]:
+        dst[j] = src[i]
+
+
+def _gather_point_dof_values(indices: wp.array[int], src: wp.array, dst: wp.array) -> None:
+    """``dst[i] = src[indices[i]]`` for the point-based warm-start fields; zero where ``indices[i]`` is the PIC null
+    index (a particle outside the grid, which only happens after a sparse-grid capacity overflow)."""
+    wp.launch(_gather_point_dof_values_kernel, dim=indices.shape[0], inputs=[indices, src, dst], device=dst.device)
+
+
+def _scatter_point_dof_values(indices: wp.array[int], src: wp.array, dst: wp.array) -> None:
+    """``dst[indices[i]] = src[i]``, skipping null indices (see :func:`_gather_point_dof_values`)."""
+    wp.launch(_scatter_point_dof_values_kernel, dim=indices.shape[0], inputs=[indices, src, dst], device=dst.device)
+
+
+# Lanes per proxy body of the fixed-order wrench harvest (see SolverImplicitMPM.coupling_harvest_proxy_wrenches).
+_HARVEST_LANES = 32
+
+
+@wp.kernel(enable_backward=False)
+def _harvest_mpm_proxy_wrench_lanes_kernel(
+    dt: float,
+    lane_count: int,
+    collider_node_offsets: wp.array[int],
+    collider_ids: wp.array[int],
+    collider_impulses: wp.array[wp.vec3],
+    collider_impulse_pos: wp.array[wp.vec3],
+    collider_body_ids: wp.array[int],
+    body_local_to_proxy_global: wp.array[int],
+    proxy_flag: int,
+    body_flags: wp.array[wp.int32],
+    body_world: wp.array[wp.int32],
+    body_com: wp.array[wp.vec3],
+    body_q: wp.array[wp.transform],
+    partial: wp.array2d[wp.spatial_vector],
+):
+    """Wrench of the collider nodes on one proxy body, one lane's share, summed in node order.
+
+    Lane ``l`` of body ``b`` visits the nodes ``begin + l, begin + l + L, ...`` of ``b``'s world range
+    ``[begin, end)`` (environment-first collider nodes, ``collider_node_offsets``; all active nodes when the solver
+    has a single environment or ``b`` belongs to no world).
+    """
+    local_body, lane = wp.tid()
+    f = wp.spatial_vector()
+    partial[local_body, lane] = f
+
+    proxy_global = body_local_to_proxy_global[local_body]
+    if proxy_global < 0 or (body_flags[local_body] & proxy_flag) == 0:
+        return
+
+    env_count = collider_node_offsets.shape[0] - 1
+    begin = int(0)
+    end = collider_ids.shape[0]
+    if env_count > 0:
+        end = collider_node_offsets[env_count]
+        world = body_world[local_body]
+        if world >= 0 and world < env_count:
+            begin = collider_node_offsets[world]
+            end = collider_node_offsets[world + 1]
+
+    center = wp.transform_point(body_q[local_body], body_com[local_body])
+    for i in range(begin + lane, end, lane_count):
+        cid = collider_ids[i]
+        if cid >= 0 and cid < collider_body_ids.shape[0]:
+            if collider_body_ids[cid] == local_body:
+                f_world = collider_impulses[i] / dt
+                r = collider_impulse_pos[i] - center
+                f += wp.spatial_vector(f_world, wp.cross(r, f_world))
+    partial[local_body, lane] = f
+
+
+@wp.kernel(enable_backward=False)
+def _sum_mpm_proxy_wrench_lanes_kernel(
+    partial: wp.array2d[wp.spatial_vector],
+    body_local_to_proxy_global: wp.array[int],
+    proxy_flag: int,
+    body_flags: wp.array[wp.int32],
+    out_body_f: wp.array[wp.spatial_vector],
+):
+    """Sum a proxy body's lane wrenches in lane order into its (zeroed) output entry."""
+    local_body = wp.tid()
+    proxy_global = body_local_to_proxy_global[local_body]
+    if proxy_global < 0 or proxy_global >= out_body_f.shape[0] or (body_flags[local_body] & proxy_flag) == 0:
+        return
+    f = wp.spatial_vector()
+    for lane in range(partial.shape[1]):
+        f += partial[local_body, lane]
+    out_body_f[proxy_global] = out_body_f[proxy_global] + f

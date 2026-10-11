@@ -56,50 +56,50 @@ def compute_body_forces(
 
 
 @wp.kernel
-def compute_body_forces_chunked(
+def compute_body_forces_lanes(
     dt: float,
-    chunk_size: int,
+    node_count: int,
     collider_ids: wp.array[int],
     collider_impulses: wp.array[wp.vec3],
     collider_impulse_pos: wp.array[wp.vec3],
     body_ids: wp.array[int],
     body_q: wp.array[wp.transform],
     body_com: wp.array[wp.vec3],
-    body_f_partial: wp.array2d[wp.spatial_vector],
+    body_f_lanes: wp.array2d[wp.spatial_vector],
 ):
-    """Sum, in node order, the sand forces of one chunk of grid nodes on one body.
+    """Sum the sand forces on one body over one lane's share of the grid nodes, in node order.
 
-    Fixed-order counterpart of :func:`compute_body_forces` for devices whose float atomics
-    are not reproducible run to run (Metal); :func:`sum_body_force_chunks` adds the chunks.
+    Fixed-order counterpart of :func:`compute_body_forces` for devices whose float atomics are not
+    reproducible run to run (Metal): lane ``l`` adds nodes ``l, l + L, l + 2L, ...`` below
+    ``node_count``; :func:`sum_body_force_lanes` adds the lanes in lane order.
     """
 
-    body_index, chunk = wp.tid()
+    body_index, lane = wp.tid()
+    lane_count = body_f_lanes.shape[1]
 
-    begin = chunk * chunk_size
-    end = wp.min(begin + chunk_size, collider_ids.shape[0])
     X_wb = body_q[body_index]
     com = wp.transform_point(X_wb, body_com[body_index])
 
     f = wp.spatial_vector()
-    for i in range(begin, end):
+    for i in range(lane, node_count, lane_count):
         cid = collider_ids[i]
         if cid >= 0 and cid < body_ids.shape[0]:
             if body_ids[cid] == body_index:
                 f_world = collider_impulses[i] / dt
                 r = collider_impulse_pos[i] - com
                 f += wp.spatial_vector(f_world, wp.cross(r, f_world))
-    body_f_partial[body_index, chunk] = f
+    body_f_lanes[body_index, lane] = f
 
 
 @wp.kernel
-def sum_body_force_chunks(
-    body_f_partial: wp.array2d[wp.spatial_vector],
+def sum_body_force_lanes(
+    body_f_lanes: wp.array2d[wp.spatial_vector],
     body_f: wp.array[wp.spatial_vector],
 ):
     body_index = wp.tid()
     f = body_f[body_index]
-    for chunk in range(body_f_partial.shape[1]):
-        f += body_f_partial[body_index, chunk]
+    for lane in range(body_f_lanes.shape[1]):
+        f += body_f_lanes[body_index, lane]
     body_f[body_index] = f
 
 
@@ -221,12 +221,11 @@ class Example:
         # per-body forces and torques applied by sand to rigid bodies
         self.body_sand_forces = wp.zeros_like(self.state_0.body_f)
 
-        # Metal's float atomics add in a different order every run; sum the sand forces in node order instead
+        # Metal's float atomics add in a different order every run; sum the sand forces in a fixed order
+        # instead: per body, 256 lanes over the filled node prefix, O(nodes) per body
         self.ordered_body_forces = getattr(self.model.device, "is_metal", False)
-        self.body_force_chunk = 256
-        n_chunks = (max_nodes + self.body_force_chunk - 1) // self.body_force_chunk
-        self.body_sand_force_chunks = wp.empty(
-            (self.model.body_count, n_chunks) if self.ordered_body_forces else (0, 0),
+        self.body_sand_force_lanes = wp.empty(
+            (self.model.body_count, 256) if self.ordered_body_forces else (0, 0),
             dtype=wp.spatial_vector,
             device=self.model.device,
         )
@@ -264,24 +263,24 @@ class Example:
     def compute_body_forces(self):
         if self.ordered_body_forces:
             wp.launch(
-                compute_body_forces_chunked,
-                dim=self.body_sand_force_chunks.shape,
+                compute_body_forces_lanes,
+                dim=self.body_sand_force_lanes.shape,
                 inputs=[
                     self.frame_dt,
-                    self.body_force_chunk,
+                    self.collider_node_count,
                     self.collider_impulse_ids,
                     self.collider_impulses,
                     self.collider_impulse_pos,
                     self.collider_body_id,
                     self.state_0.body_q,
                     self.model.body_com,
-                    self.body_sand_force_chunks,
+                    self.body_sand_force_lanes,
                 ],
             )
             wp.launch(
-                sum_body_force_chunks,
+                sum_body_force_lanes,
                 dim=self.model.body_count,
-                inputs=[self.body_sand_force_chunks, self.state_0.body_f],
+                inputs=[self.body_sand_force_lanes, self.state_0.body_f],
             )
             return
 
@@ -306,6 +305,8 @@ class Example:
         )
         self.collider_impulse_ids.fill_(-1)
         n_colliders = min(collider_impulses.shape[0], self.collider_impulses.shape[0])
+        # entries past it keep id -1 (no body); the ordered force sum scans the larger of this and earlier counts
+        self.collider_node_count = max(getattr(self, "collider_node_count", 0), n_colliders)
         self.collider_impulses[:n_colliders].assign(collider_impulses[:n_colliders])
         self.collider_impulse_pos[:n_colliders].assign(collider_impulse_pos[:n_colliders])
         self.collider_impulse_ids[:n_colliders].assign(collider_impulse_ids[:n_colliders])
