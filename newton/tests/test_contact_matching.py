@@ -152,12 +152,12 @@ def test_save_initializes_next_frame_claims(test, device):
         matcher = pipeline._contact_matcher
         test.assertIsNotNone(matcher)
 
-        matcher._prev_claim.fill_(wp.int64(0))
+        matcher._prev_claim.fill_(wp.uint64(0))
         count = _collide_once(pipeline, state, contacts)
         test.assertGreater(count, 0)
         np.testing.assert_array_equal(
             matcher._prev_claim.numpy()[:count],
-            np.full(count, int(_CLAIM_SENTINEL), dtype=np.int64),
+            np.full(count, int(_CLAIM_SENTINEL), dtype=np.uint64),
         )
 
         test.assertEqual(_collide_once(pipeline, state, contacts), count)

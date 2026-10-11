@@ -37,9 +37,15 @@ One-to-one match via packed atomic_min
 A pair-range scan can have multiple new contacts pick the same prev
 contact as their closest.  To keep the mapping injective without
 sorting or CAS retries, the matcher uses a single ``wp.atomic_min`` per
-new contact on a per-prev ``int64`` claim word:
+new contact on a per-prev ``uint64`` claim word:
 
-    claim = (float_flip(dist_sq) << 32) | (sort_key & 0xFFFFFFFF)
+    claim = ((float_flip(dist_sq) ^ 0x80000000) << 32) | (sort_key & 0xFFFFFFFF)
+
+(an unsigned word, so the minimum is a hardware atomic on Metal too, where
+signed 64-bit atomic min does not exist; for the non-negative ``dist_sq``
+fed in, ``float_flip`` sets bit 31, which the xor clears, so the words
+order exactly as the earlier signed ``(float_flip(dist_sq) << 32) | ...``
+claims did and the low 32 bits are unchanged)
 
 ``float_flip`` reinterprets the non-negative ``dist_sq`` as a
 sortable ``uint32``, so the high 32 bits order claims by ascending
@@ -60,7 +66,7 @@ After the match kernel runs, a small finalize kernel reads
 :data:`MATCH_BROKEN`.  Losers are *not* re-matched against a
 second-closest prev (kept for simplicity and speed).
 
-Cost: one ``int64[capacity]`` buffer, one ``wp.atomic_min`` per new
+Cost: one ``uint64[capacity]`` buffer, one ``wp.atomic_min`` per new
 contact, and one short finalize kernel launch.  No ``atomic_cas``.
 
 Memory efficiency
@@ -123,10 +129,10 @@ MATCH_BROKEN = wp.constant(wp.int32(-2))
 # ------------------------------------------------------------------
 
 
-# Sentinel value for unclaimed slots in ``_prev_claim``.  Larger than
-# any packed (flipped_dist << 32 | key_low32) any kernel will ever
+# Sentinel value for unclaimed slots in ``_prev_claim``.  Not smaller
+# than any packed claim (see :func:`_pack_claim`) any kernel will ever
 # produce, so the first ``atomic_min`` always wins.
-_CLAIM_SENTINEL = wp.constant(wp.int64(0x7FFFFFFFFFFFFFFF))
+_CLAIM_SENTINEL = wp.constant(wp.uint64(0xFFFFFFFFFFFFFFFF))
 
 
 @wp.kernel(enable_backward=False)
@@ -178,10 +184,13 @@ def _float_flip(f: float) -> wp.uint32:
 
 
 @wp.func
-def _pack_claim(dist_sq: float, key_low32: wp.int64) -> wp.int64:
-    """Pack ``(dist_sq, sort_key_low32)`` into a single int64 for ``atomic_min``.
+def _pack_claim(dist_sq: float, key_low32: wp.int64) -> wp.uint64:
+    """Pack ``(dist_sq, sort_key_low32)`` into a single uint64 for ``atomic_min``.
 
-    High 32 bits: ``float_flip(dist_sq)`` — ascending by distance.
+    High 32 bits: ``float_flip(dist_sq) ^ 0x80000000`` — ascending by distance
+        (``dist_sq`` is non-negative, so ``float_flip`` sets bit 31; clearing it
+        keeps the order and makes the unsigned word order like the signed
+        claims used before, so the same claim wins).
     Low 32 bits:  the low 32 bits of the contact's sort key — deterministic
         tie-break (smallest wins).  Using the sort key (rather than the
         unsorted thread id) keeps the resolution invariant under
@@ -211,8 +220,8 @@ def _pack_claim(dist_sq: float, key_low32: wp.int64) -> wp.int64:
     other words, this scheme is no worse than what the upstream sort
     already provides.
     """
-    flipped = wp.int64(_float_flip(dist_sq))
-    return (flipped << wp.int64(32)) | (key_low32 & wp.int64(0xFFFFFFFF))
+    flipped = wp.uint64(_float_flip(dist_sq) ^ wp.uint32(0x80000000))
+    return (flipped << wp.uint64(32)) | (wp.uint64(key_low32) & wp.uint64(0xFFFFFFFF))
 
 
 # ------------------------------------------------------------------
@@ -253,7 +262,7 @@ class _MatchData:
     # key (deterministic per contact, invariant under non-deterministic
     # narrow-phase slot assignment -- see ``_pack_claim``).
     # Initialised to _CLAIM_SENTINEL each frame; race with atomic_min.
-    prev_claim: wp.array[wp.int64]
+    prev_claim: wp.array[wp.uint64]
 
     # Per-new candidate prev index (final value resolved in pass 2).
     match_index: wp.array[wp.int32]
@@ -360,7 +369,7 @@ def _match_contacts_kernel(data: _MatchData):
 def _resolve_claims_kernel(
     match_index: wp.array[wp.int32],
     sort_keys: wp.array[wp.int64],
-    prev_claim: wp.array[wp.int64],
+    prev_claim: wp.array[wp.uint64],
     prev_was_matched: wp.array[wp.int32],
     new_count: wp.array[wp.int32],
     has_report: int,
@@ -381,7 +390,7 @@ def _resolve_claims_kernel(
     if cand < wp.int32(0):
         return  # already MATCH_NOT_FOUND or MATCH_BROKEN
 
-    winner_key_low = prev_claim[cand] & wp.int64(0xFFFFFFFF)
+    winner_key_low = wp.int64(prev_claim[cand] & wp.uint64(0xFFFFFFFF))
     my_key_low = sort_keys[tid] & wp.int64(0xFFFFFFFF)
     if winner_key_low == my_key_low:
         if has_report != 0:
@@ -433,7 +442,7 @@ class _SaveStateData:
     # ``sort_full`` and the next ``save_sorted_state``) is not reading the
     # sorter's ``scratch_normal`` after the sort has clobbered it.
     dst_normal_sticky: wp.array[wp.vec3]
-    dst_claim: wp.array[wp.int64]
+    dst_claim: wp.array[wp.uint64]
     dst_prev_was_matched: wp.array[wp.int32]
     dst_count: wp.array[wp.int32]
 
@@ -698,7 +707,7 @@ class ContactMatcher:
             # mapping injective (see module docstring). The save-state pass resets
             # each active slot for the next frame; initialize the allocation for
             # the first frame before any state has been saved.
-            self._prev_claim = wp.full(capacity, _CLAIM_SENTINEL, dtype=wp.int64)
+            self._prev_claim = wp.full(capacity, _CLAIM_SENTINEL, dtype=wp.uint64)
 
             # Contact report (optional).
             self._has_report = contact_report

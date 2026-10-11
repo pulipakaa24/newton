@@ -104,15 +104,17 @@ def hashtable_find(
 
 
 # Metal has no 64-bit compare-and-swap (Apple GPUs offer only 64-bit atomic min/max, without a return
-# value), and Warp lowers a 64-bit ``wp.atomic_cas`` there to a plain read-modify-write. Concurrent
-# inserts then claim the same slot, overwrite each other's keys and append the slot to the active list
-# more than once. On Metal the table therefore claims a slot with a 32-bit compare-and-swap on the key's
+# value). Warp used to lower a 64-bit ``wp.atomic_cas`` there to a plain read-modify-write (concurrent
+# inserts then claimed the same slot, overwrote each other's keys and appended the slot to the active
+# list more than once); the MetalSim Warp fork now refuses it (the kernel raises at launch). On Metal the table therefore claims a slot with a 32-bit compare-and-swap on the key's
 # high word (EMPTY -> _HASHTABLE_CLAIMED_HI) and then publishes the whole key with one 64-bit atomic min
 # (the claimed word compares greater than every valid key). Readers inside the insert kernel see an
 # empty, a claimed (in flight) or a settled slot; a claimed slot is re-read on the next pass of a loop
 # that every lane of a SIMD-group runs, so the claimant (possibly a lane of the same SIMD-group)
 # finishes publishing first. Valid keys must keep bit 63 clear (every Newton key does: contact keys use
-# 63 bits, Morton voxel keys 63 bits); other keys fall back to the plain update.
+# 63 bits, Morton voxel keys 63 bits); on Metal a key with bit 63 set is not inserted (the insert returns
+# -1, as for a full table): it would need the 64-bit compare-and-swap Metal does not have, which Warp
+# refuses there rather than lowering it to a racy plain update.
 _HASHTABLE_CLAIMED_HI = wp.constant(wp.uint32(0x80000000))
 _HASHTABLE_EMPTY_HI = wp.constant(wp.uint32(0xFFFFFFFF))
 
@@ -169,6 +171,21 @@ return false;
 """)
 def _hashtable_claim(keys: wp.array[wp.uint64], idx: int) -> bool:
     """Claim an empty slot: high word EMPTY -> _HASHTABLE_CLAIMED_HI (may fail spuriously; callers retry)."""
+    ...
+
+
+@wp.func_native("""
+#if defined(__METAL_VERSION__)
+// never reached on Metal (hashtable_find_or_insert takes the claimed path there); neither compare nor value, so a
+// caller would keep probing
+uint64_t other = compare + 1;
+return other == value ? other + 1 : other;
+#else
+return wp::atomic_cas(keys, idx, compare, value);
+#endif
+""")
+def _hashtable_cas_key(keys: wp.array[wp.uint64], idx: int, compare: wp.uint64, value: wp.uint64) -> wp.uint64:
+    """64-bit compare-and-swap of a key slot on CUDA and CPU (Metal has none, see _HASHTABLE_CLAIMED_HI)."""
     ...
 
 
@@ -230,8 +247,10 @@ def hashtable_find_or_insert(
     Returns:
         Entry index (>= 0) if successful, -1 if the table is full
     """
-    if _hashtable_use_claims() and (key >> wp.uint64(63)) == wp.uint64(0):
-        return _hashtable_find_or_insert_claimed(key, keys, active_slots)
+    if _hashtable_use_claims():
+        if (key >> wp.uint64(63)) == wp.uint64(0):
+            return _hashtable_find_or_insert_claimed(key, keys, active_slots)
+        return -1  # Metal: bit 63 set, no atomic insert without a 64-bit compare-and-swap
 
     capacity = keys.shape[0]
     capacity_mask = capacity - 1
@@ -248,7 +267,7 @@ def hashtable_find_or_insert(
 
         if stored_key == HASHTABLE_EMPTY_KEY:
             # Try to claim this slot
-            old_key = wp.atomic_cas(keys, idx, HASHTABLE_EMPTY_KEY, key)
+            old_key = _hashtable_cas_key(keys, idx, HASHTABLE_EMPTY_KEY, key)
 
             if old_key == HASHTABLE_EMPTY_KEY:
                 # We claimed an empty slot - this is a NEW entry
