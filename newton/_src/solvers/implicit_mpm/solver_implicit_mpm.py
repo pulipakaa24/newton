@@ -9,7 +9,7 @@ import operator
 from collections.abc import Sequence
 from dataclasses import dataclass
 from itertools import pairwise
-from typing import Literal
+from typing import Any, Literal
 
 import numpy as np
 import warp as wp
@@ -3354,7 +3354,9 @@ class SolverImplicitMPM(SolverBase, CouplingInterface):
 
         if isinstance(prev_impulse_field.space.basis, fem.PointBasisSpace):
             # point-based collisions, simply copy the previous impulses
-            scratch.impulse_field.dof_values.assign(prev_impulse_field.dof_values[pic.cell_particle_indices])
+            _gather_point_dof_values(
+                pic.cell_particle_indices, prev_impulse_field.dof_values, scratch.impulse_field.dof_values
+            )
         elif grid_to_grid_warmstart:
             # Interpolate previous impulse
             prev_impulse_field = fem.NonconformingField(
@@ -3372,7 +3374,9 @@ class SolverImplicitMPM(SolverBase, CouplingInterface):
 
         # Interpolate previous stress
         if isinstance(prev_stress_field.space.basis, fem.PointBasisSpace):
-            scratch.stress_field.dof_values.assign(prev_stress_field.dof_values[pic.cell_particle_indices])
+            _gather_point_dof_values(
+                pic.cell_particle_indices, prev_stress_field.dof_values, scratch.stress_field.dof_values
+            )
         elif self._stress_warmstart in ("grid", "smoothed") and grid_to_grid_warmstart:
             prev_stress_field = fem.NonconformingField(
                 domain, prev_stress_field, background=scratch.background_stress_field
@@ -3398,8 +3402,10 @@ class SolverImplicitMPM(SolverBase, CouplingInterface):
 
             if isinstance(last_step_data.ws_impulse_field.space.basis, fem.PointBasisSpace):
                 # point-based collisions, simply copy the previous impulses
-                last_step_data.ws_impulse_field.dof_values[pic.cell_particle_indices].assign(
-                    scratch.impulse_field.dof_values
+                _scatter_point_dof_values(
+                    pic.cell_particle_indices,
+                    scratch.impulse_field.dof_values,
+                    last_step_data.ws_impulse_field.dof_values,
                 )
             else:
                 last_step_data.ws_impulse_field.dof_values.zero_()
@@ -3415,8 +3421,10 @@ class SolverImplicitMPM(SolverBase, CouplingInterface):
 
             last_step_data.rebind_strain_space_fields(scratch, smoothed=self._stress_warmstart == "smoothed")
             if isinstance(last_step_data.ws_stress_field.space.basis, fem.PointBasisSpace):
-                last_step_data.ws_stress_field.dof_values[pic.cell_particle_indices].assign(
-                    scratch.stress_field.dof_values
+                _scatter_point_dof_values(
+                    pic.cell_particle_indices,
+                    scratch.stress_field.dof_values,
+                    last_step_data.ws_stress_field.dof_values,
                 )
             else:
                 last_step_data.ws_stress_field.dof_values.zero_()
@@ -3740,3 +3748,32 @@ def _harvest_mpm_proxy_wrenches_kernel(
     center = wp.transform_point(body_q[local_body], body_com[local_body])
     r = collider_impulse_pos[i] - center
     wp.atomic_add(out_body_f, proxy_global, wp.spatial_vector(f_world, wp.cross(r, f_world)))
+
+
+@wp.kernel(enable_backward=False)
+def _gather_point_dof_values_kernel(indices: wp.array[int], src: wp.array[Any], dst: wp.array[Any]):
+    i = wp.tid()
+    j = indices[i]
+    if j >= 0 and j < src.shape[0]:
+        dst[i] = src[j]
+    else:
+        dst[i] = dst.dtype()
+
+
+@wp.kernel(enable_backward=False)
+def _scatter_point_dof_values_kernel(indices: wp.array[int], src: wp.array[Any], dst: wp.array[Any]):
+    i = wp.tid()
+    j = indices[i]
+    if j >= 0 and j < dst.shape[0]:
+        dst[j] = src[i]
+
+
+def _gather_point_dof_values(indices: wp.array[int], src: wp.array, dst: wp.array) -> None:
+    """``dst[i] = src[indices[i]]`` for the point-based warm-start fields; zero where ``indices[i]`` is the PIC null
+    index (a particle outside the grid, which only happens after a sparse-grid capacity overflow)."""
+    wp.launch(_gather_point_dof_values_kernel, dim=indices.shape[0], inputs=[indices, src, dst], device=dst.device)
+
+
+def _scatter_point_dof_values(indices: wp.array[int], src: wp.array, dst: wp.array) -> None:
+    """``dst[indices[i]] = src[i]``, skipping null indices (see :func:`_gather_point_dof_values`)."""
+    wp.launch(_scatter_point_dof_values_kernel, dim=indices.shape[0], inputs=[indices, src, dst], device=dst.device)
