@@ -1151,6 +1151,46 @@ def mesh_vs_convex_midphase(
 
 
 @wp.func
+def mesh_vs_convex_midphase_thread(
+    mesh_shape: int,
+    non_mesh_shape: int,
+    X_mesh_ws: wp.transform,
+    X_ws: wp.transform,
+    mesh_id: wp.uint64,
+    shape_type: wp.array[int],
+    shape_data: wp.array[wp.vec4],
+    shape_source_ptr: wp.array[wp.uint64],
+    contact_threshold: float,
+    triangle_pairs: wp.array[wp.vec3i],
+    triangle_pairs_count: wp.array[int],
+):
+    """:func:`mesh_vs_convex_midphase` for one thread per pair (no thread-block BVH query).
+
+    Same query box, front-facing filter and triangles, emitted in BVH traversal order.
+    Used where ``wp.tile_mesh_query_aabb`` has no cooperative implementation (Metal:
+    there every thread of the block repeats the whole traversal and one triangle is
+    emitted per block-wide step).
+    """
+    aabb_lower, aabb_upper, center_in_bvh = _compute_mesh_vs_convex_query_aabb(
+        mesh_shape,
+        non_mesh_shape,
+        X_mesh_ws,
+        X_ws,
+        shape_type,
+        shape_data,
+        shape_source_ptr,
+        contact_threshold,
+    )
+    query = wp.mesh_query_aabb(mesh_id, aabb_lower, aabb_upper)
+    tri_index = wp.int32(0)
+    while wp.mesh_query_aabb_next(query, tri_index):
+        if tri_index >= 0 and _mesh_triangle_is_front_facing_local(mesh_id, center_in_bvh, tri_index):
+            out_idx = wp.atomic_add(triangle_pairs_count, 0, 1)
+            if out_idx < triangle_pairs.shape[0]:
+                triangle_pairs[out_idx] = wp.vec3i(mesh_shape, non_mesh_shape, tri_index)
+
+
+@wp.func
 def find_pair_from_cumulative_index(
     global_idx: int,
     cumulative_sums: wp.array[int],
