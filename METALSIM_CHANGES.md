@@ -38,7 +38,10 @@ changes below modify Apache-2.0 code and are offered under the same licence.
 | `555d6af8` | Barrier before each reset of the mesh-SDF kernels' shared `progress` counter: a thread still making its last loop check could re-enter the culling loop alone and pair its barriers with the wrong ones, which hung the GPU on Metal at 2,048 Franka worlds. Results unchanged whenever the race did not fire. |
 | `1298fbbb` | 32 mesh threadgroups per GPU core on Metal (collide 80 -> 67 ms at 2,048 worlds), now that the race is fixed. |
 | `ddb015b9` | Deterministic mode on Metal sorts and gathers only the active contacts (key preparation with `dim_limit`, radix sort with `count_limit`): sort 12.4 -> 0.2 ms, deterministic collide 192.6 -> 68.3 ms at 2,048 worlds. |
-| this commit | `METALSIM_CHANGES.md`. |
+| `35791a07` | `METALSIM_CHANGES.md`. |
+| `3813cbba` | Kamino metric argmax keys (63-bit) without 64-bit exchange on Metal (the Warp fork refuses it at launch, so the EoM / kinematics / joint / limit metric kernels did not run there): per-thread key scratch, per-world 64-bit max of (value rank, ~thread), a finalize launch per metric kernel; the key of the maximum, lowest thread on ties. CPU / CUDA keep the exchange. Same protocol as on `metalsim` (1.7). |
+| `e0c7c82e` | HashTable's Metal claim loop bounded (probes plus 65,536 passes, then -1 as for a full table, counted in `ht_insert_failures`): Apple GPUs give no forward-progress guarantee, so no thread may wait without bound for a claimant. |
+| this commit | `METALSIM_CHANGES.md` rows for `3813cbba` and `e0c7c82e`. |
 
 `c0a98819` … `ddb015b9` were written on top of `eac15793` (as `de978b55`, `7beedf43`, `0013572a`, `ced01724`) and
 cherry-picked onto `c1ab1cdc` unchanged; the resulting tree is the union of both lines.
