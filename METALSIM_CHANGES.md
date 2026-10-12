@@ -26,6 +26,16 @@ changes below modify Apache-2.0 code and are offered under the same licence.
 | `242eeda7` | Drive force reported per DOF. |
 | `90e23324` | Fast path for PD drive rows on hinges. |
 
+| `fb95e095` | `METALSIM_CHANGES.md`. |
+| `d06b2c02` | HashTable insertion atomic on Metal (Metal has no 64-bit compare-and-swap and Warp lowered `atomic_cas` on 64-bit keys to a plain read-modify-write: concurrent inserts of the contact-reduction table overwrote each other, so contacts changed from run to run). A slot is claimed with a 32-bit compare-and-swap on the key's high word, then the key is published with a 64-bit atomic min; CPU and CUDA keep the original code. |
+| `7d80b8a5` | No 64-bit atomics Metal cannot make atomic: the 64-bit CAS moves into a native helper that is not compiled for Metal (keys with bit 63 set are refused there; Newton's keys never set it); contact matching claims with an unsigned 64-bit minimum (same winner on every device). Needed with the Warp fork's `metalsim` branch from `c1bb061b` on, which raises at launch for the refused atomics instead of running them non-atomically (the rough G1 task otherwise fails in `reduce_buffered_contacts_kernel`). |
+| this commit | `METALSIM_CHANGES.md` rows for the two commits above. |
+
+`d06b2c02` and `7d80b8a5` are `299d5432` and `33f4783a` (written on `90e23324`) cherry-picked unchanged. The same
+two fixes on upstream `45458023` itself (the Newton that MetalSim's `newton` extra installs into `.venv`) are branch
+`metalsim-hashtable-metal`, `24fb5367`. In the G1 rough task at 4,096 worlds the stock table listed 221 K duplicate
+slots and lost 104 K keys per collide on Metal; the fixed one none (MetalSim, 2026-10-11).
+
 This branch defaults to `joint_drive_mode="pd"`; upstream's compliance drive stays available.
 
 ## Upstream
