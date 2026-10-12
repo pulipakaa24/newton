@@ -1078,6 +1078,14 @@ def create_narrow_phase_process_mesh_mesh_contacts_kernel(
                 edge_range_tri = shape_edge_range[tri_shape]
                 num_edges = get_edge_count(tri_type, edge_range_tri, hfd_tri)
 
+                # Barrier before resetting ``progress``: the previous pass's last
+                # ``while wp.tile_extract(progress, 0) < ...`` check is a plain
+                # shared-memory read, and a thread still making it would see the
+                # new start below, re-enter the culling loop alone and pair its
+                # barriers with the wrong ones (on Metal this hung the GPU at
+                # 2,048 Franka worlds; more resident threadgroups per core made
+                # it likelier). The stack is empty here, so the clear only syncs.
+                wp.tile_stack_clear(edge_stack)
                 wp.tile_scatter_masked(progress, 0, 0, t == 0)
 
                 sdf_is_heightfield = sdf_is_hfield
@@ -1499,6 +1507,14 @@ def create_narrow_phase_process_mesh_mesh_contacts_kernel(
                 edge_start = block_in_pair * chunk_size
                 edge_end = wp.min(edge_start + chunk_size, num_edges)
 
+                # Barrier before resetting ``progress``: the previous pass's last
+                # ``while wp.tile_extract(progress, 0) < ...`` check is a plain
+                # shared-memory read, and a thread still making it would see the
+                # new start below, re-enter the culling loop alone and pair its
+                # barriers with the wrong ones (on Metal this hung the GPU at
+                # 2,048 Franka worlds; more resident threadgroups per core made
+                # it likelier). The stack is empty here, so the clear only syncs.
+                wp.tile_stack_clear(edge_stack)
                 wp.tile_scatter_masked(progress, 0, edge_start, t == 0)
 
                 sdf_is_heightfield = sdf_is_hfield
