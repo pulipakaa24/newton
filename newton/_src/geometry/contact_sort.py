@@ -14,6 +14,8 @@ are filled with ``0x7FFFFFFFFFFFFFFF`` so they sort to the end.
 
 from __future__ import annotations
 
+import inspect
+
 import warp as wp
 
 from ..core.types import Devicelike
@@ -21,6 +23,37 @@ from ..core.types import Devicelike
 # Sentinel key for unused contact slots.  ``radix_sort_pairs`` treats
 # keys as signed int64, so ``0x7FFF…`` (max positive int64) sorts last.
 SORT_KEY_SENTINEL = wp.constant(wp.int64(0x7FFFFFFFFFFFFFFF))
+
+# Warp builds whose wp.launch takes a device-side launch bound (``dim_limit``; the MetalSim fork) can stop the sort's
+# kernels at the active contact count on Metal; elsewhere they run over the full capacity, as before.
+_LAUNCH_HAS_DIM_LIMIT = "dim_limit" in inspect.signature(wp.launch).parameters
+
+
+def _metal_count_bound(contact_count: wp.array) -> wp.array | None:
+    """``contact_count`` as a device-side bound for the sort's launches, or ``None`` (full-capacity launches).
+
+    Only on Metal builds of Warp with bounded launches and the GPU radix sort's internal ``count_limit``
+    (``warp._src.metal_primitives``): there the active prefix is sorted and gathered exactly as by the
+    full-capacity sort, whose sentinel keys keep the unused slots after it in their original order.
+    """
+    if not _LAUNCH_HAS_DIM_LIMIT or not getattr(contact_count.device, "is_metal", False):
+        return None
+    if contact_count.dtype != wp.int32 or contact_count.size != 1:
+        return None
+    if not getattr(wp.config, "metal_gpu_utilities", False) or not getattr(wp.config, "metal_bounded_launch", False):
+        return None
+    try:
+        from warp._src import metal_primitives  # noqa: PLC0415
+    except ImportError:
+        return None
+    if "count_limit" not in inspect.signature(metal_primitives.radix_sort_pairs).parameters:
+        return None
+    return contact_count
+
+
+def _bounded(dim_limit: wp.array | None) -> dict:
+    """``wp.launch`` keyword arguments for an optional device-side launch bound."""
+    return {} if dim_limit is None else {"dim_limit": dim_limit}
 
 
 @wp.kernel(enable_backward=False)
@@ -298,8 +331,11 @@ class ContactSorter:
         data.has_tangent = 1 if has_tangent else 0
         data.has_match_index = 1 if has_match else 0
 
-        wp.launch(_backup_simple_kernel, dim=n, inputs=[data, contact_count], device=device)
-        wp.launch(_gather_simple_kernel, dim=n, inputs=[data, self._sort_indices, contact_count], device=device)
+        bounded = _bounded(_metal_count_bound(contact_count))
+        wp.launch(_backup_simple_kernel, dim=n, inputs=[data, contact_count], device=device, **bounded)
+        wp.launch(
+            _gather_simple_kernel, dim=n, inputs=[data, self._sort_indices, contact_count], device=device, **bounded
+        )
 
     def sort_full(
         self,
@@ -389,8 +425,11 @@ class ContactSorter:
         data.has_shape_props = 1 if has_props else 0
         data.has_match_index = 1 if has_match else 0
 
-        wp.launch(_backup_full_kernel, dim=n, inputs=[data, contact_count], device=device)
-        wp.launch(_gather_full_kernel, dim=n, inputs=[data, self._sort_indices, contact_count], device=device)
+        bounded = _bounded(_metal_count_bound(contact_count))
+        wp.launch(_backup_full_kernel, dim=n, inputs=[data, contact_count], device=device, **bounded)
+        wp.launch(
+            _gather_full_kernel, dim=n, inputs=[data, self._sort_indices, contact_count], device=device, **bounded
+        )
 
     @property
     def sorted_keys_view(self) -> wp.array:
@@ -436,10 +475,19 @@ class ContactSorter:
     def _sort_and_permute(self, sort_keys: wp.array, contact_count: wp.array, *, device: Devicelike = None) -> None:
         """Prepare keys (sentinel-fill unused slots), then radix-sort over the full buffer."""
         n = self._capacity
+        bound = _metal_count_bound(contact_count)
         wp.launch(
             _prepare_sort,
             dim=n,
             inputs=[contact_count, sort_keys, self._sort_keys_copy, self._sort_indices],
             device=device,
+            **_bounded(bound),
         )
-        wp.utils.radix_sort_pairs(self._sort_keys_copy, self._sort_indices, n)
+        if bound is None:
+            wp.utils.radix_sort_pairs(self._sort_keys_copy, self._sort_indices, n)
+            return
+        # Metal: only the active prefix is prepared and sorted. Its sorted pairs are those of the full sort, where
+        # every unused slot holds the sentinel key (larger than any active key) and keeps its place after them.
+        from warp._src import metal_primitives  # noqa: PLC0415
+
+        metal_primitives.radix_sort_pairs(self._sort_keys_copy, self._sort_indices, n, 0, 64, 4, count_limit=bound)
