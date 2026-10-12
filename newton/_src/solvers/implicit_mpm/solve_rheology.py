@@ -16,6 +16,7 @@ import warp.fem as fem
 import warp.sparse as sp
 from warp.fem.linalg import array_axpy
 from warp.optim.linear import LinearOperator, cg, cr, gmres
+from warp._src.sparse import _bsr_row_end
 
 from .contact_solver_kernels import (
     apply_nodal_impulse_warmstart,
@@ -340,6 +341,132 @@ def apply_rigidity_operator(rigidity_operator, delta_collider_impulse, collider_
     J, IJtm = rigidity_operator
     sp.bsr_mv(IJtm, x=delta_collider_impulse, y=delta_body_qd, alpha=-1.0, beta=0.0)
     sp.bsr_mv(J, x=delta_body_qd, y=collider_velocity, alpha=1.0, beta=1.0)
+
+
+@wp.kernel
+def _bsr_nonempty_row_flags(offsets: wp.array[int], row_counts: wp.array[int], flags: wp.array[int]):
+    row = wp.tid()
+    flags[row] = wp.where(_bsr_row_end(offsets, row_counts, row) > offsets[row], 1, 0)
+
+
+@wp.kernel
+def _bsr_compact_rows(flags: wp.array[int], positions: wp.array[int], rows: wp.array[int], count: wp.array[int]):
+    row = wp.tid()
+    if flags[row] != 0:
+        rows[positions[row]] = row
+    if row == flags.shape[0] - 1:
+        count[0] = positions[row] + flags[row]
+
+
+@wp.kernel
+def _bsr_mv_listed_rows(
+    alpha: float,
+    A_offsets: wp.array[int],
+    A_row_counts: wp.array[int],
+    A_columns: wp.array[int],
+    A_values: wp.array3d[float],
+    x: wp.array[float],
+    beta: float,
+    y: wp.array[float],
+    rows: wp.array[int],
+    row_count: wp.array[int],
+):
+    # warp.sparse's bsr_mv_kernel (the form bsr_mv launches off CUDA) for the listed rows, 3 block columns
+    k, subrow = wp.tid()
+    if k >= row_count[0]:  # the bounded launch may still run the rest of its last threadgroup
+        return
+    row = rows[k]
+
+    block_rows = A_values.shape[1]
+
+    yi = row * block_rows + subrow
+
+    scalar_zero = float(0)
+    v = scalar_zero
+
+    if alpha != scalar_zero:
+        beg = A_offsets[row]
+        end = _bsr_row_end(A_offsets, A_row_counts, row)
+        for block in range(beg, end):
+            xs = A_columns[block] * 3
+            for col in range(wp.static(3)):
+                v += A_values[block, subrow, col] * x[xs + col]
+        v *= alpha
+
+    if beta != scalar_zero:
+        v += beta * y[yi]
+
+    y[yi] = v
+
+
+class _ListedRowsMv:
+    """``y = alpha * A @ x + beta * y`` on the rows of ``A`` that hold blocks, as ``warp.sparse.bsr_mv`` computes them
+    off CUDA (same kernel body, same block and column order).
+
+    Used inside the rheology loop after one full product: an empty row ``r`` sets ``y[r]`` to ``beta * y[r]`` plus
+    a zero (``0.0 + y[r]`` with ``beta = 1``, ``-0.0`` with ``alpha = -1, beta = 0``), which is idempotent once applied,
+    so skipping the empty rows in the later products leaves every value bit for bit as the full product would. The
+    row list and its length are built on the device; the launch is bounded by that length.
+    """
+
+    def __init__(self, A: sp.BsrMatrix, x: wp.array, y: wp.array, alpha: float, beta: float):
+        from warp._src.sparse import _vec_array_view  # noqa: PLC0415
+        from warp.utils import array_scan  # noqa: PLC0415
+
+        device = A.values.device
+        self.A = A
+        self.alpha = A.scalar_type(alpha)
+        self.beta = A.scalar_type(beta)
+        self.x = _vec_array_view(x, A.scalar_type, expected_scalar_count=A.ncol * A.block_shape[1])
+        self.y = _vec_array_view(y, A.scalar_type, expected_scalar_count=A.nrow * A.block_shape[0])
+        nrow = A.nrow
+        self.rows = wp.empty(max(nrow, 1), dtype=int, device=device)
+        self.count = wp.zeros(1, dtype=int, device=device)
+        if nrow > 0:
+            flags = wp.empty(nrow, dtype=int, device=device)
+            positions = wp.empty(nrow, dtype=int, device=device)
+            wp.launch(_bsr_nonempty_row_flags, dim=nrow, inputs=[A.offsets, A.row_counts, flags], device=device)
+            array_scan(flags, positions, inclusive=False)
+            wp.launch(_bsr_compact_rows, dim=nrow, inputs=[flags, positions, self.rows, self.count], device=device)
+        self.device = device
+
+    def launch(self):
+        A = self.A
+        if A.nrow == 0:
+            return
+        wp.launch(
+            _bsr_mv_listed_rows,
+            dim=(A.nrow, A.block_shape[0]),
+            inputs=[
+                self.alpha,
+                A.offsets,
+                A.row_counts,
+                A.columns,
+                A.scalar_values,
+                self.x,
+                self.beta,
+                self.y,
+                self.rows,
+                self.count,
+            ],
+            device=self.device,
+            dim_limit=self.count,
+        )
+
+
+def _listed_rows_mv_supported(A: sp.BsrMatrix) -> bool:
+    """Metal (where ``bsr_mv`` runs the non-tiled kernel) with bounded launches, 3-column blocks, and enough rows
+    for the row list to pay for its extra dispatches (``NEWTON_METAL_LISTED_ROWS_MIN``, default 8,192 rows; one
+    Franka-Pour world has 735 collider nodes); not on ``NEWTON_METAL_LISTED_ROWS_MV=0``."""
+    import os  # noqa: PLC0415
+
+    return (
+        _LAUNCH_HAS_DIM_LIMIT
+        and getattr(A.values.device, "is_metal", False)
+        and A.block_shape[1] == 3
+        and os.environ.get("NEWTON_METAL_LISTED_ROWS_MV", "1") != "0"
+        and A.nrow >= int(os.environ.get("NEWTON_METAL_LISTED_ROWS_MIN", "8192"))
+    )
 
 
 class _ScopedDisableGC:
@@ -1639,9 +1766,15 @@ class _ContactSolver:
         self.collider_inv_mass = fem.borrow_temporary_like(self.collision.collider_friction, temporary_store)
 
         # Setup rigidity correction
+        self._iteration_rigidity = None
         if self.collision.rigidity_operator is not None:
             J, IJtm = self.collision.rigidity_operator
             self.delta_body_qd = fem.borrow_temporary(temporary_store, shape=J.shape[1], dtype=float)
+            if _listed_rows_mv_supported(J) and IJtm.block_shape[1] == 3:
+                self._iteration_rigidity = (
+                    _ListedRowsMv(IJtm, self.delta_impulse, self.delta_body_qd, alpha=-1.0, beta=0.0),
+                    _ListedRowsMv(J, self.delta_body_qd, self.collision.collider_velocities, alpha=1.0, beta=1.0),
+                )
 
             wp.launch(
                 compute_collider_inv_mass,
@@ -1676,6 +1809,15 @@ class _ContactSolver:
                 self.collision.collider_velocities,
                 self.delta_body_qd,
             )
+
+    def apply_rigidity_operator_in_loop(self):
+        """:meth:`apply_rigidity_operator` after the initial guess has applied it once: the empty rows' results
+        are then fixed points (see :class:`_ListedRowsMv`), so only the rows with blocks are recomputed."""
+        if self._iteration_rigidity is None:
+            self.apply_rigidity_operator()
+            return
+        for mv in self._iteration_rigidity:
+            mv.launch()
 
 
 class _NodalContactSolver(_ContactSolver):
@@ -1724,7 +1866,7 @@ class _NodalContactSolver(_ContactSolver):
 
     def solve(self):
         self.solve_collider_launch.launch()
-        self.apply_rigidity_operator()
+        self.apply_rigidity_operator_in_loop()
 
 
 class _SubgridContactSolver(_ContactSolver):
@@ -1809,7 +1951,7 @@ class _SubgridContactSolver(_ContactSolver):
     def solve(self):
         self.solve_collider_launch.launch()
         self.apply_collider_impulse_launch.launch()
-        self.apply_rigidity_operator()
+        self.apply_rigidity_operator_in_loop()
 
     def release(self):
         self.collider_delassus_diagonal.release()
