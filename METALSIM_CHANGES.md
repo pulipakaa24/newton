@@ -41,7 +41,10 @@ changes below modify Apache-2.0 code and are offered under the same licence.
 | `35791a07` | `METALSIM_CHANGES.md`. |
 | `3813cbba` | Kamino metric argmax keys (63-bit) without 64-bit exchange on Metal (the Warp fork refuses it at launch, so the EoM / kinematics / joint / limit metric kernels did not run there): per-thread key scratch, per-world 64-bit max of (value rank, ~thread), a finalize launch per metric kernel; the key of the maximum, lowest thread on ties. CPU / CUDA keep the exchange. Same protocol as on `metalsim` (1.7). |
 | `e0c7c82e` | HashTable's Metal claim loop bounded (probes plus 65,536 passes, then -1 as for a full table, counted in `ht_insert_failures`): Apple GPUs give no forward-progress guarantee, so no thread may wait without bound for a claimant. |
-| this commit | `METALSIM_CHANGES.md` rows for `3813cbba` and `e0c7c82e`. |
+| `c0427fc7` | `METALSIM_CHANGES.md` rows for `3813cbba` and `e0c7c82e`. |
+| `27415f95` | Metal: the rigidity operator (`J`, `IJtm`) is assembled from its kept triplet slots only (moved to the front in slot order, count passed to `bsr_set_from_triplets`; the stable sort orders them as before, so the matrices are the same). Franka-Pour MPM at 2,048 worlds: collider compliance 6.4 -> 3.1 ms of GPU time per step; bitwise. `NEWTON_METAL_RIGIDITY_COMPACT=0` restores the full assembly. |
+| `80e79684` | Metal: in the rheology loop the two rigidity products run only on the rows with blocks (listed on the device, launch bounded by the list length with an in-kernel guard): an empty row's result is a fixed point once the initial guess applied the full product, so every value is the same. From 8,192 rows (`NEWTON_METAL_LISTED_ROWS_MIN`); `NEWTON_METAL_LISTED_ROWS_MV=0` restores the full products. Franka-Pour 2,048 worlds: 8.8 -> 2.6 ms of GPU time per step; bitwise (1 / 64 / 2,048 worlds, eager and captured). |
+| this commit | `METALSIM_CHANGES.md` rows for `27415f95` and `80e79684`. With the Warp fork's `8631b6b0` and `fddebdbd`: Franka-Pour MPM captured step at 2,048 worlds 90.5-91.2 -> 78.9-79.0 ms, Franka-Pour policy step (2,048 envs, M4 Max) 2.06 -> 1.81 s. |
 
 `c0a98819` … `ddb015b9` were written on top of `eac15793` (as `de978b55`, `7beedf43`, `0013572a`, `ced01724`) and
 cherry-picked onto `c1ab1cdc` unchanged; the resulting tree is the union of both lines.
