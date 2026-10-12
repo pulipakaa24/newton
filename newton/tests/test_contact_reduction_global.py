@@ -72,8 +72,10 @@ def get_winning_contacts(reducer: GlobalContactReducer) -> list[int]:
         # Slot-major layout: slot * capacity + entry_idx
         for slot in range(values_per_key):
             val = values[slot * capacity + entry_idx]
-            if val != 0:
-                contact_id = val & contact_id_mask
+            contact_id = val & contact_id_mask
+            # ID zero marks a provisional winner, which the export kernels skip (on Metal a provisional claim is
+            # not rolled back when the contact buffer is exhausted)
+            if val != 0 and contact_id != 0:
                 contact_ids.add(int(contact_id))
 
     return sorted(contact_ids)
