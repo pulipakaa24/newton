@@ -84,6 +84,9 @@ from ..core.state import StateKamino
 from ..core.types import vec6f
 from ..dynamics.dual import DualProblem
 from ..geometry.contacts import ContactsKamino
+from newton._src.geometry.contact_reduction import float_flip
+from newton._src.geometry.hashtable import _hashtable_use_claims
+
 from ..geometry.keying import build_pair_key2
 from ..kinematics.jacobians import DenseSystemJacobians, SparseSystemJacobians
 from ..kinematics.limits import LimitsKamino
@@ -586,6 +589,66 @@ def compute_vector_difference_infnorm(
 ###
 
 
+# 64-bit argmax keys on Metal. Apple GPUs have no 64-bit exchange (only unsigned 64-bit atomic min/max, without a
+# return value; the MetalSim Warp fork refuses a 64-bit ``wp.atomic_exch`` there at launch), and a key is 63 bits, too
+# wide to share one atomic word with its value. On Metal each thread that would store its key writes it to its own slot
+# of a scratch array instead and takes a per-world 64-bit atomic max of ``(float_flip(value) << 32) | (0xFFFFFFFF -
+# tid)``; after the kernel, ``_finalize_metric_argmax_key64`` (one thread per world) copies the key of the launch's
+# maximum when it is the world's maximum. The key then belongs to the maximum (lowest thread on ties), where the
+# exchange keeps whichever qualifying thread wrote last. CPU and CUDA keep the exchange (in a native helper that is not
+# compiled for Metal).
+@wp.func_native("""
+#if !defined(__METAL_VERSION__)
+wp::atomic_exch(metric_argmax, wid, key);
+#endif
+""")
+def _exch_argmax_key64(metric_argmax: wp.array[wp.int64], wid: wp.int32, key: wp.int64):
+    """Atomic 64-bit store of an argmax key on CUDA and CPU (not used on Metal)."""
+    ...
+
+
+@wp.func
+def _store_argmax_key64(
+    metric_argmax: wp.array[wp.int64],
+    wid: wp.int32,
+    key: wp.int64,
+    argmax_packed: wp.array[wp.uint64],
+    argmax_scratch: wp.array[wp.int64],
+    tid: wp.int32,
+    value: wp.float32,
+):
+    """Store the argmax key of a thread whose value reached the world's maximum (Metal: see above)."""
+    if _hashtable_use_claims():
+        if not wp.isnan(value):
+            argmax_scratch[tid] = key
+            packed = (wp.uint64(float_flip(value)) << wp.uint64(32)) | wp.uint64(
+                wp.uint32(0xFFFFFFFF) - wp.uint32(tid)
+            )
+            wp.atomic_max(argmax_packed, wid, packed)
+        return
+    _exch_argmax_key64(metric_argmax, wid, key)
+
+
+@wp.kernel
+def _finalize_metric_argmax_key64(
+    metric: wp.array[wp.float32],
+    argmax_packed: wp.array[wp.uint64],
+    argmax_scratch: wp.array[wp.int64],
+    metric_argmax: wp.array[wp.int64],
+):
+    """Per world, after a metric kernel on Metal: store the key of that launch's maximum, with the exchange's rule."""
+    wid = wp.tid()
+    packed = argmax_packed[wid]
+    if packed == wp.uint64(0):
+        return  # no thread of this world reached the maximum in this launch
+    current = metric[wid]
+    # the exchange stores a key when the value is at least the maximum before it, i.e. when this launch's maximum is
+    # the world's maximum now
+    if not wp.isnan(current) and float_flip(current) == wp.uint32(packed >> wp.uint64(32)):
+        tid = wp.uint32(0xFFFFFFFF) - wp.uint32(packed & wp.uint64(0xFFFFFFFF))
+        metric_argmax[wid] = argmax_scratch[wp.int32(tid)]
+
+
 @wp.kernel
 def _compute_eom_residual(
     # Inputs
@@ -600,6 +663,8 @@ def _compute_eom_residual(
     # Outputs
     metric_r_eom: wp.array[wp.float32],
     metric_r_eom_argmax: wp.array[wp.int64],
+    metric_argmax_packed: wp.array[wp.uint64],
+    metric_argmax_scratch: wp.array[wp.int64],
 ):
     # Retrieve the thread index as the body index
     bid = wp.tid()
@@ -638,7 +703,9 @@ def _compute_eom_residual(
     previous_max = wp.atomic_max(metric_r_eom, wid, r_eom_i)
     if r_eom_i >= previous_max:
         argmax_key = wp.int64(build_pair_key2(wp.uint32(bid), wp.uint32(r_eom_argmax_i)))
-        wp.atomic_exch(metric_r_eom_argmax, wp.int32(wid), argmax_key)
+        _store_argmax_key64(
+            metric_r_eom_argmax, wid, argmax_key, metric_argmax_packed, metric_argmax_scratch, bid, r_eom_i
+        )
 
 
 @wp.kernel
@@ -658,6 +725,8 @@ def _compute_joint_kinematics_residual_dense(
     # Outputs:
     metric_r_kinematics: wp.array[wp.float32],
     metric_r_kinematics_argmax: wp.array[wp.int64],
+    metric_argmax_packed: wp.array[wp.uint64],
+    metric_argmax_scratch: wp.array[wp.int64],
 ):
     # Retrieve the joint index from the thread index
     jid = wp.tid()
@@ -705,7 +774,9 @@ def _compute_joint_kinematics_residual_dense(
     previous_max = wp.atomic_max(metric_r_kinematics, wid, r_kinematics_j)
     if r_kinematics_j >= previous_max:
         argmax_key = wp.int64(build_pair_key2(wp.uint32(jid), wp.uint32(cts_offset_j - kgo) + kin_argmax_local))
-        wp.atomic_exch(metric_r_kinematics_argmax, wid, argmax_key)
+        _store_argmax_key64(
+            metric_r_kinematics_argmax, wid, argmax_key, metric_argmax_packed, metric_argmax_scratch, jid, r_kinematics_j
+        )
 
 
 @wp.kernel
@@ -724,6 +795,8 @@ def _compute_joint_kinematics_residual_sparse(
     # Outputs:
     metric_r_kinematics: wp.array[wp.float32],
     metric_r_kinematics_argmax: wp.array[wp.int64],
+    metric_argmax_packed: wp.array[wp.uint64],
+    metric_argmax_scratch: wp.array[wp.int64],
 ):
     # Retrieve the joint index from the thread index
     jid = wp.tid()
@@ -765,7 +838,9 @@ def _compute_joint_kinematics_residual_sparse(
     previous_max = wp.atomic_max(metric_r_kinematics, wid, r_kinematics_j)
     if r_kinematics_j >= previous_max:
         argmax_key = wp.int64(build_pair_key2(wp.uint32(jid), wp.uint32(kin_cts_offset_j) + kin_argmax_local))
-        wp.atomic_exch(metric_r_kinematics_argmax, wid, argmax_key)
+        _store_argmax_key64(
+            metric_r_kinematics_argmax, wid, argmax_key, metric_argmax_packed, metric_argmax_scratch, jid, r_kinematics_j
+        )
 
 
 @wp.kernel
@@ -779,6 +854,8 @@ def _compute_cts_joints_residual(
     # Outputs:
     metric_r_cts_joints: wp.array[wp.float32],
     metric_r_cts_joints_argmax: wp.array[wp.int64],
+    metric_argmax_packed: wp.array[wp.uint64],
+    metric_argmax_scratch: wp.array[wp.int64],
 ):
     # Retrieve the joint index from the thread index
     jid = wp.tid()
@@ -804,7 +881,9 @@ def _compute_cts_joints_residual(
     if r_cts_joints_j >= previous_max:
         cio_j_loc = cio_j - model_info_joint_kinematic_cts_offset[wid]
         argmax_key = wp.int64(build_pair_key2(wp.uint32(jid), wp.uint32(cio_j_loc + argmax_j)))
-        wp.atomic_exch(metric_r_cts_joints_argmax, wid, argmax_key)
+        _store_argmax_key64(
+            metric_r_cts_joints_argmax, wid, argmax_key, metric_argmax_packed, metric_argmax_scratch, jid, r_cts_joints_j
+        )
 
 
 @wp.kernel
@@ -818,6 +897,8 @@ def _compute_cts_limits_residual(
     # Outputs:
     metric_r_cts_limits: wp.array[wp.float32],
     metric_r_cts_limits_argmax: wp.array[wp.int64],
+    metric_argmax_packed: wp.array[wp.uint64],
+    metric_argmax_scratch: wp.array[wp.int64],
 ):
     # Retrieve the thread index as the limit index
     lid = wp.tid()
@@ -841,7 +922,9 @@ def _compute_cts_limits_residual(
     previous_max = wp.atomic_max(metric_r_cts_limits, wid, r_cts_limits_l)
     if r_cts_limits_l >= previous_max:
         argmax_key = wp.int64(build_pair_key2(wp.uint32(wlid), wp.uint32(dof)))
-        wp.atomic_exch(metric_r_cts_limits_argmax, wid, argmax_key)
+        _store_argmax_key64(
+            metric_r_cts_limits_argmax, wid, argmax_key, metric_argmax_packed, metric_argmax_scratch, lid, r_cts_limits_l
+        )
 
 
 @wp.kernel
@@ -1111,6 +1194,8 @@ class SolutionMetrics:
         # Declare data buffers for metrics computations
         self._buffer_s: wp.array[wp.float32] | None = None
         self._buffer_v: wp.array[wp.float32] | None = None
+        self._argmax_packed: wp.array[wp.uint64] | None = None
+        self._argmax_scratch: wp.array[wp.int64] | None = None
 
         # If a model is provided, finalize the metrics data allocations
         if model is not None:
@@ -1134,6 +1219,13 @@ class SolutionMetrics:
         with wp.ScopedDevice(self._device):
             # Allocate reusable buffers for metrics computations
             self._buffer_v = wp.zeros(model.size.sum_of_max_total_cts, dtype=wp.float32)
+            # 64-bit argmax keys on Metal (see _atomic_update_metric_max_key64): per-world packed maxima and per-thread
+            # keys of the metric launch in flight (unused on CPU and CUDA)
+            self._argmax_packed = wp.zeros(model.size.num_worlds, dtype=wp.uint64)
+            self._argmax_scratch = wp.zeros(
+                max(1, model.size.sum_of_num_bodies, model.size.sum_of_num_joints, model.size.sum_of_max_limits),
+                dtype=wp.int64,
+            )
             self._buffer_s = wp.zeros(model.size.sum_of_max_total_cts, dtype=wp.float32)
 
             # Allocate the metrics container data arrays
@@ -1228,6 +1320,24 @@ class SolutionMetrics:
     # Internals
     ###
 
+    def _argmax_key64_begin(self, dim: int = 0):
+        """Before a metric kernel with 64-bit argmax keys: clear the packed maxima (Metal only)."""
+        if dim > self._argmax_scratch.shape[0]:
+            self._argmax_scratch = wp.zeros(dim, dtype=wp.int64, device=self._device)
+        if getattr(wp.get_device(self._device), "is_metal", False):
+            self._argmax_packed.zero_()
+
+    def _argmax_key64_end(self, metric: wp.array, metric_argmax: wp.array):
+        """After a metric kernel with 64-bit argmax keys: store the winners' keys (Metal only)."""
+        if getattr(wp.get_device(self._device), "is_metal", False):
+            wp.launch(
+                kernel=_finalize_metric_argmax_key64,
+                dim=metric.shape[0],
+                inputs=[metric, self._argmax_packed, self._argmax_scratch],
+                outputs=[metric_argmax],
+                device=self._device,
+            )
+
     def _assert_has_data(self):
         """
         Asserts that the metrics data has been finalized and is available.
@@ -1259,6 +1369,7 @@ class SolutionMetrics:
 
         # Compute the largest configuration-level joint constraint residuals (i.e. violations)
         if model.size.sum_of_num_joints > 0:
+            self._argmax_key64_begin()
             wp.launch(
                 kernel=_compute_cts_joints_residual,
                 dim=model.size.sum_of_num_joints,
@@ -1272,12 +1383,16 @@ class SolutionMetrics:
                     # Outputs:
                     self._data.r_cts_joints,
                     self._data.r_cts_joints_argmax,
+                    self._argmax_packed,
+                    self._argmax_scratch,
                 ],
                 device=model.device,
             )
+            self._argmax_key64_end(self._data.r_cts_joints, self._data.r_cts_joints_argmax)
 
         # Compute the largest joint-limit constraint residuals (i.e. penetrations)
         if limits is not None and limits.model_max_limits_host > 0:
+            self._argmax_key64_begin(limits.data.model_max_limits_host)
             wp.launch(
                 kernel=_compute_cts_limits_residual,
                 dim=limits.data.model_max_limits_host,
@@ -1291,9 +1406,12 @@ class SolutionMetrics:
                     # Outputs:
                     self._data.r_cts_limits,
                     self._data.r_cts_limits_argmax,
+                    self._argmax_packed,
+                    self._argmax_scratch,
                 ],
                 device=model.device,
             )
+            self._argmax_key64_end(self._data.r_cts_limits, self._data.r_cts_limits_argmax)
 
         # Compute the largest contact constraint residuals (i.e. penetrations)
         if contacts is not None and contacts.model_max_contacts_host > 0:
@@ -1333,6 +1451,7 @@ class SolutionMetrics:
         self._assert_has_data()
 
         # Compute the equations-of-motion residuals
+        self._argmax_key64_begin()
         wp.launch(
             kernel=_compute_eom_residual,
             dim=model.size.sum_of_num_bodies,
@@ -1349,14 +1468,18 @@ class SolutionMetrics:
                 # Outputs:
                 self._data.r_eom,
                 self._data.r_eom_argmax,
+                self._argmax_packed,
+                self._argmax_scratch,
             ],
             device=model.device,
         )
+        self._argmax_key64_end(self._data.r_eom, self._data.r_eom_argmax)
 
         # Compute the kinematics constraint residuals,
         # i.e. velocity-level joint constraint equations
         if model.size.sum_of_num_joints > 0:
             if isinstance(jacobians, DenseSystemJacobians):
+                self._argmax_key64_begin()
                 wp.launch(
                     kernel=_compute_joint_kinematics_residual_dense,
                     dim=model.size.sum_of_num_joints,
@@ -1376,11 +1499,15 @@ class SolutionMetrics:
                         # Outputs:
                         self._data.r_kinematics,
                         self._data.r_kinematics_argmax,
+                        self._argmax_packed,
+                        self._argmax_scratch,
                     ],
                     device=model.device,
                 )
+                self._argmax_key64_end(self._data.r_kinematics, self._data.r_kinematics_argmax)
             else:
                 J_cts = jacobians._J_cts.bsm
+                self._argmax_key64_begin()
                 wp.launch(
                     kernel=_compute_joint_kinematics_residual_sparse,
                     dim=model.size.sum_of_num_joints,
@@ -1399,9 +1526,12 @@ class SolutionMetrics:
                         # Outputs:
                         self._data.r_kinematics,
                         self._data.r_kinematics_argmax,
+                        self._argmax_packed,
+                        self._argmax_scratch,
                     ],
                     device=model.device,
                 )
+                self._argmax_key64_end(self._data.r_kinematics, self._data.r_kinematics_argmax)
 
     def _evaluate_dual_problem_perf(
         self,
