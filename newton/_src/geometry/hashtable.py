@@ -117,6 +117,10 @@ def hashtable_find(
 # refuses there rather than lowering it to a racy plain update.
 _HASHTABLE_CLAIMED_HI = wp.constant(wp.uint32(0x80000000))
 _HASHTABLE_EMPTY_HI = wp.constant(wp.uint32(0xFFFFFFFF))
+# Hard bound on the claim loop's passes beyond one per probed slot. Apple GPUs give no forward-progress guarantee
+# between lanes or threadgroups, so a thread must never wait without bound for a claimant to publish: one that runs
+# out of passes returns -1 (as for a full table; reducers count it in ``ht_insert_failures``) instead of hanging.
+_HASHTABLE_MAX_WAIT_PASSES = wp.constant(1 << 16)
 
 
 @wp.func_native("""
@@ -200,9 +204,11 @@ def _hashtable_find_or_insert_claimed(
     capacity_mask = capacity - 1
     idx = _hashtable_hash(key, capacity_mask)
     probes = int(0)
+    passes = int(0)
     result = int(-1)
     pending = bool(True)
-    while pending:
+    while pending and passes < capacity + _HASHTABLE_MAX_WAIT_PASSES:
+        passes += 1
         hi = _hashtable_load_hi(keys, idx)
         if hi == _HASHTABLE_EMPTY_HI:
             if _hashtable_claim(keys, idx):
