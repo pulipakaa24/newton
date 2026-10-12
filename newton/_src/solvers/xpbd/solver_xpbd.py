@@ -199,6 +199,9 @@ class SolverXPBD(SolverBase, CouplingInterface):
 
         self.enable_restitution = enable_restitution
         self._rigid_restitution_enabled = False
+        self.restitution_insert_failures: wp.array | None = None
+        """Contacts the restitution manifold table could not take (Metal's bounded claim loop), cumulative; ``None``
+        until rigid restitution first runs."""
         self._refresh_rigid_restitution_enabled()
         self._compute_body_velocity_from_position_delta = False
 
@@ -452,6 +455,9 @@ class SolverXPBD(SolverBase, CouplingInterface):
                 rigid_contact_inv_weight = wp.zeros(model.body_count, dtype=float, device=model.device)
             if self.enable_restitution and self._rigid_restitution_enabled and model.body_count:
                 restitution_contact_active = wp.zeros(contacts.rigid_contact_max, dtype=wp.int32, device=model.device)
+                if self.restitution_insert_failures is None:
+                    # contacts the manifold table could not take (Metal's bounded claim loop only; cumulative)
+                    self.restitution_insert_failures = wp.zeros(1, dtype=wp.int32, device=model.device)
                 # manifold hash table (one slot may host every contact, so
                 # capacity == contact capacity guarantees insertion succeeds)
                 restitution_manifold_key = wp.zeros(contacts.rigid_contact_max, dtype=wp.int64, device=model.device)
@@ -1008,6 +1014,7 @@ class SolverXPBD(SolverBase, CouplingInterface):
                             restitution_contact_axn_lo_target,
                             restitution_contact_axn_hi_sigma,
                             restitution_contact_pos_depth,
+                            self.restitution_insert_failures,
                         ],
                         device=model.device,
                     )
