@@ -1815,12 +1815,12 @@ class NarrowPhase:
             self.mesh_plane_weight_prefix_sums = wp.zeros(n, dtype=wp.int32, device=device)
             if getattr(device_obj, "is_metal", False):  # Metal-enabled Warp builds only
                 # Metal keeps the non-CUDA work split (``target_blocks`` above, so every (pair, sub-block)
-                # combo covers the same edges / vertices) but launches 4 threadgroups per GPU core, as CUDA
-                # does per SM: the kernels stride over the combos by the launched count, and 64 threadgroups
-                # leave most of an M4 Max's 40 cores idle (mesh-mesh SDF kernel at 2,048 Franka worlds:
-                # 109 -> 73 ms; 8 and 16 per core measured no faster).
-                self.num_mesh_mesh_blocks = max(target_blocks, device_obj.sm_count * 4)
-                self.num_mesh_plane_blocks = max(target_blocks, device_obj.sm_count * 4)
+                # combo covers the same edges / vertices) but launches 32 threadgroups per GPU core: the
+                # kernels stride over the combos by the launched count, and 64 threadgroups leave most of an
+                # M4 Max's 40 cores idle. Collide at 2,048 Franka worlds by threadgroups per core: 1.6 (64):
+                # 175 ms, 4: 80, 8: 71, 16: 71, 32: 67, 64: 66 ms. Threadgroups without a combo exit at once.
+                self.num_mesh_mesh_blocks = max(target_blocks, device_obj.sm_count * 32)
+                self.num_mesh_plane_blocks = max(target_blocks, device_obj.sm_count * 32)
         else:
             self.num_mesh_mesh_blocks = self.num_tile_blocks
             self.mesh_mesh_target_blocks = self.num_tile_blocks
