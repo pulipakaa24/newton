@@ -3,8 +3,129 @@
 
 import warp as wp
 
+from ...geometry.hashtable import _hashtable_use_claims
 from ...math import velocity_at_point
 from ...sim.contacts import contact_surface_point, contact_surface_separation
+
+# Manifold table on Metal. Apple GPUs have no 64-bit compare-and-swap (only unsigned 64-bit atomic min/max, without a
+# return value; the MetalSim Warp fork refuses a 64-bit ``wp.atomic_cas`` there at launch). On Metal a slot is claimed
+# with a 32-bit compare-and-swap of its high word (0 -> _MANIFOLD_CLAIMED_HI), then the whole key is published with one
+# 64-bit atomic min, as Newton's HashTable does. Stored keys carry _MANIFOLD_KEY_TAG so that an occupied high word is
+# never 0 (empty) nor _MANIFOLD_CLAIMED_HI: keys are below (body_count + 1)^2 < 2^62. Readers mask the tag off (a no-op
+# on CPU and CUDA, which store the plain key). A thread that finds a slot claimed re-reads it on the next pass of a
+# loop every lane runs; the claimant only has its publish left. The loop is bounded so that no schedule can turn it
+# into a GPU hang: a contact that runs out of passes is left out of restitution, as on CUDA when the table is full.
+_MANIFOLD_KEY_TAG = wp.constant(wp.int64(1 << 62))
+_MANIFOLD_KEY_MASK = wp.constant(wp.int64((1 << 62) - 1))
+_MANIFOLD_CLAIMED_HI = wp.constant(wp.uint32(0x80000000))
+_MANIFOLD_MAX_WAIT_PASSES = wp.constant(1 << 16)
+
+
+@wp.func_native("""
+#if defined(__METAL_VERSION__)
+device metal::atomic_uint* word = (device metal::atomic_uint*)(keys.data + idx) + 1;
+return metal::atomic_load_explicit(word, metal::memory_order_relaxed);
+#else
+return static_cast<uint32_t>(static_cast<uint64_t>(keys.data[idx]) >> 32);
+#endif
+""")
+def _manifold_load_hi(keys: wp.array[wp.int64], idx: int) -> wp.uint32:
+    """Atomically read the high word of a manifold slot."""
+    ...
+
+
+@wp.func_native("""
+#if defined(__METAL_VERSION__)
+device metal::atomic_uint* word = (device metal::atomic_uint*)(keys.data + idx);
+const uint64_t lo = metal::atomic_load_explicit(word, metal::memory_order_relaxed);
+const uint64_t hi = metal::atomic_load_explicit(word + 1, metal::memory_order_relaxed);
+return (int64_t)((hi << 32) | lo);
+#else
+return keys.data[idx];
+#endif
+""")
+def _manifold_load_key(keys: wp.array[wp.int64], idx: int) -> wp.int64:
+    """Atomically read a published manifold slot (both words are final once the high word is)."""
+    ...
+
+
+@wp.func_native("""
+#if defined(__METAL_VERSION__)
+device metal::atomic_uint* word = (device metal::atomic_uint*)(keys.data + idx) + 1;
+uint expected = 0u;
+return metal::atomic_compare_exchange_weak_explicit(
+    word, &expected, 0x80000000u, metal::memory_order_relaxed, metal::memory_order_relaxed);
+#else
+return false;
+#endif
+""")
+def _manifold_claim(keys: wp.array[wp.int64], idx: int) -> bool:
+    """Claim an empty slot: high word 0 -> _MANIFOLD_CLAIMED_HI (may fail spuriously; callers re-read)."""
+    ...
+
+
+@wp.func_native("""
+#if defined(__METAL_VERSION__)
+// the claimed slot reads (_MANIFOLD_CLAIMED_HI, 0), above every tagged key, so the minimum writes the key
+metal::atomic_min_explicit((device metal::atomic_ulong*)(keys.data + idx), (uint64_t)value, metal::memory_order_relaxed);
+#endif
+""")
+def _manifold_publish(keys: wp.array[wp.int64], idx: int, value: wp.int64):
+    """Publish a tagged key into a slot this thread claimed (Metal only)."""
+    ...
+
+
+@wp.func_native("""
+#if defined(__METAL_VERSION__)
+// never reached on Metal (build_restitution_manifolds takes the claim / publish path there)
+return compare + 1 == value ? compare + 2 : compare + 1;
+#else
+return wp::atomic_cas(keys, idx, compare, value);
+#endif
+""")
+def _manifold_cas(keys: wp.array[wp.int64], idx: int, compare: wp.int64, value: wp.int64) -> wp.int64:
+    """64-bit compare-and-swap of a manifold slot on CUDA and CPU."""
+    ...
+
+
+@wp.func
+def _manifold_key(stored: wp.int64) -> wp.int64:
+    """Body-pair key of a stored slot (strips the Metal tag; 0 for an empty slot)."""
+    return stored & _MANIFOLD_KEY_MASK
+
+
+@wp.func
+def _manifold_insert_claimed(manifold_key: wp.array[wp.int64], key: wp.int64, slot_start: wp.int32) -> wp.int32:
+    """Slot of ``key`` in the manifold table on Metal (inserting it), or -1 (table full / out of passes)."""
+    table_size = manifold_key.shape[0]
+    stored = key | _MANIFOLD_KEY_TAG
+    slot = slot_start
+    result = wp.int32(-1)
+    probes = int(0)
+    passes = int(0)
+    pending = bool(True)
+    while pending and passes < table_size + _MANIFOLD_MAX_WAIT_PASSES:
+        passes += 1
+        hi = _manifold_load_hi(manifold_key, slot)
+        if hi == wp.uint32(0):
+            if _manifold_claim(manifold_key, slot):
+                _manifold_publish(manifold_key, slot, stored)
+                result = slot
+                pending = False
+            # lost the claim (or failed spuriously): look at the same slot again
+        elif hi != _MANIFOLD_CLAIMED_HI:
+            if _manifold_load_key(manifold_key, slot) == stored:
+                result = slot
+                pending = False
+            else:
+                slot += 1
+                if slot == table_size:
+                    slot = 0
+                probes += 1
+                if probes >= table_size:
+                    pending = False
+        # else: another thread is publishing its key in this slot; look again
+    return result
 
 
 @wp.kernel
@@ -104,7 +225,8 @@ def build_restitution_manifolds(
     The collision pipeline interleaves contacts across pairs, so contacts are
     not pair-contiguous. Each active contact inserts its canonical body-pair
     key (``(lo+1)*(body_count+1) + hi+1 >= 1``; 0 means an empty slot) into an
-    open-addressing hash table via ``atomic_cas`` and pushes its contact index
+    open-addressing hash table via ``atomic_cas`` (on Metal a 32-bit claim and a
+    64-bit atomic min, see ``_MANIFOLD_KEY_TAG``) and pushes its contact index
     onto the slot's uncapped linked chain
     (``manifold_head``/``contact_next``); :func:`select_manifold_contacts`
     later reduces each chain to a bounded best-K subset. Fixed-size table, no
@@ -241,9 +363,16 @@ def build_restitution_manifolds(
     key = wp.int64(lo + 1) * wp.int64(body_count + 1) + wp.int64(hi + 1)
     table_size = manifold_key.shape[0]
     slot = wp.int32(key % wp.int64(table_size))
+    if _hashtable_use_claims():
+        # Metal: claim / publish (see _MANIFOLD_KEY_TAG); same probe sequence as below
+        slot = _manifold_insert_claimed(manifold_key, key, slot)
+        if slot >= 0:
+            wp.atomic_add(manifold_total, slot, 1)
+            contact_next[tid] = wp.atomic_exch(manifold_head, slot, tid + 1) - 1
+        return
     # linear probing; table capacity >= contact capacity so a slot always exists
     for _attempt in range(table_size):
-        prev = wp.atomic_cas(manifold_key, slot, wp.int64(0), key)
+        prev = _manifold_cas(manifold_key, slot, wp.int64(0), key)
         if prev == wp.int64(0) or prev == key:
             wp.atomic_add(manifold_total, slot, 1)
             # heads store index+1 so a zeroed table means empty (memset-cheap reset)
@@ -440,7 +569,7 @@ def solve_manifold_restitution(
     """
     tid = wp.tid()
 
-    key = manifold_key[tid]
+    key = _manifold_key(manifold_key[tid])
     if key == wp.int64(0):
         return
 
