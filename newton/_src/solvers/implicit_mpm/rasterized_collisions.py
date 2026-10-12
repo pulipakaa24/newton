@@ -1,6 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
+import os
+
 import warp as wp
 import warp.fem as fem
 import warp.sparse as wps
@@ -857,6 +859,11 @@ def build_rigidity_operator(
         ],
     )
 
+    if getattr(J_rows.device, "is_metal", False) and os.environ.get("NEWTON_METAL_RIGIDITY_COMPACT", "1") != "0":
+        return _rigidity_matrices_compacted(
+            vel_node_count, particle_block_offset + deformable_vertex_count, J_rows, J_cols, J_values, IJtm_values
+        )
+
     J = wps.bsr_from_triplets(
         rows_of_blocks=vel_node_count,
         cols_of_blocks=particle_block_offset + deformable_vertex_count,
@@ -873,4 +880,71 @@ def build_rigidity_operator(
         values=IJtm_values,
     )
 
+    return J, IJtm
+
+
+@wp.kernel
+def _triplet_slot_valid(rows: wp.array[int], cols: wp.array[int], valid: wp.array[int]):
+    i = wp.tid()
+    valid[i] = wp.where(rows[i] >= 0 and cols[i] >= 0, 1, 0)
+
+
+@wp.kernel
+def _compact_triplet_slots(
+    rows: wp.array[int],
+    cols: wp.array[int],
+    J_values: wp.array[wp.mat33],
+    IJtm_values: wp.array[wp.mat33],
+    position: wp.array[int],
+    rows_out: wp.array[int],
+    cols_out: wp.array[int],
+    J_values_out: wp.array[wp.mat33],
+    IJtm_values_out: wp.array[wp.mat33],
+    count: wp.array[int],
+):
+    i = wp.tid()
+    n = rows.shape[0]
+    if i == n - 1:
+        count[0] = position[i] + wp.where(rows[i] >= 0 and cols[i] >= 0, 1, 0)
+    if rows[i] >= 0 and cols[i] >= 0:
+        k = position[i]
+        rows_out[k] = rows[i]
+        cols_out[k] = cols[i]
+        J_values_out[k] = J_values[i]
+        IJtm_values_out[k] = IJtm_values[i]
+
+
+def _rigidity_matrices_compacted(row_blocks, col_blocks, J_rows, J_cols, J_values, IJtm_values):
+    """``J`` and ``IJtm`` as :func:`build_rigidity_operator` assembles them, from the kept triplets only.
+
+    Most slots are empty (nodes away from dynamic colliders). The kept ones are moved to the front in slot order and
+    their count is passed to the assembly, whose stable sort then orders only those: every kept triplet keeps its
+    rank among the kept ones, so offsets, columns and values are the same as from the full triplet arrays (empty
+    slots map to the sentinel key there and are dropped).
+    """
+    from warp.utils import array_scan  # noqa: PLC0415
+
+    n = J_rows.shape[0]
+    device = J_rows.device
+    valid = wp.empty(n, dtype=int, device=device)
+    position = wp.empty(n, dtype=int, device=device)
+    rows_c = wp.empty(n, dtype=int, device=device)
+    cols_c = wp.empty(n, dtype=int, device=device)
+    J_values_c = wp.empty(n, dtype=wp.mat33, device=device)
+    IJtm_values_c = wp.empty(n, dtype=wp.mat33, device=device)
+    count = wp.zeros(1, dtype=int, device=device)
+    if n > 0:
+        wp.launch(_triplet_slot_valid, dim=n, inputs=[J_rows, J_cols, valid], device=device)
+        array_scan(valid, position, inclusive=False)
+        wp.launch(
+            _compact_triplet_slots,
+            dim=n,
+            inputs=[J_rows, J_cols, J_values, IJtm_values, position, rows_c, cols_c, J_values_c, IJtm_values_c, count],
+            device=device,
+        )
+
+    J = wps.bsr_zeros(row_blocks, col_blocks, block_type=wp.mat33, device=device)
+    wps.bsr_set_from_triplets(J, rows_c, cols_c, J_values_c, count=count)
+    IJtm = wps.bsr_zeros(col_blocks, row_blocks, block_type=wp.mat33, device=device)
+    wps.bsr_set_from_triplets(IJtm, cols_c, rows_c, IJtm_values_c, count=count)
     return J, IJtm
