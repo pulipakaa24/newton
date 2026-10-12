@@ -14,7 +14,8 @@ from ...sim.contacts import contact_surface_point, contact_surface_separation
 # never 0 (empty) nor _MANIFOLD_CLAIMED_HI: keys are below (body_count + 1)^2 < 2^62. Readers mask the tag off (a no-op
 # on CPU and CUDA, which store the plain key). A thread that finds a slot claimed re-reads it on the next pass of a
 # loop every lane runs; the claimant only has its publish left. The loop is bounded so that no schedule can turn it
-# into a GPU hang: a contact that runs out of passes is left out of restitution, as on CUDA when the table is full.
+# into a GPU hang: a contact that runs out of passes is left out of restitution, as on CUDA when the table is full,
+# and counted in ``insert_failures`` (``SolverXPBD.restitution_insert_failures``).
 _MANIFOLD_KEY_TAG = wp.constant(wp.int64(1 << 62))
 _MANIFOLD_KEY_MASK = wp.constant(wp.int64((1 << 62) - 1))
 _MANIFOLD_CLAIMED_HI = wp.constant(wp.uint32(0x80000000))
@@ -219,6 +220,7 @@ def build_restitution_manifolds(
     contact_axn_lo_target: wp.array[wp.vec4],
     contact_axn_hi_sigma: wp.array[wp.vec4],
     contact_pos_depth: wp.array[wp.vec4],
+    insert_failures: wp.array[wp.int32],
 ):
     """Group contacts that can fire restitution into per-body-pair manifolds.
 
@@ -369,6 +371,8 @@ def build_restitution_manifolds(
         if slot >= 0:
             wp.atomic_add(manifold_total, slot, 1)
             contact_next[tid] = wp.atomic_exch(manifold_head, slot, tid + 1) - 1
+        else:
+            wp.atomic_add(insert_failures, 0, 1)  # SolverXPBD.restitution_insert_failures
         return
     # linear probing; table capacity >= contact capacity so a slot always exists
     for _attempt in range(table_size):
