@@ -59,6 +59,8 @@ import warp as wp
 from newton._src.geometry.hashtable import (
     HASHTABLE_EMPTY_KEY,
     HashTable,
+    _hashtable_load_key,
+    _hashtable_use_claims,
     hashtable_find,
     hashtable_find_or_insert,
 )
@@ -252,6 +254,25 @@ def reduction_try_update_slot(
     return wp.atomic_max(values, value_idx, value)
 
 
+# Metal has no 64-bit compare-and-swap (Apple GPUs offer only 64-bit atomic min/max, without a return value; the
+# MetalSim Warp fork refuses a 64-bit ``wp.atomic_cas`` there at launch). On Metal the provisional claims below are
+# therefore finalized with a 64-bit atomic max and a read-back, and never rolled back, so every write to a slot is a
+# max: a displaced value never returns, and a thread owns a slot exactly when the slot holds its final value.
+# CPU and CUDA keep the compare-and-swap (in a native helper that is not compiled for Metal).
+@wp.func_native("""
+#if defined(__METAL_VERSION__)
+// never reached on Metal (the callers take the max / read-back protocol there)
+uint64_t other = compare + 1;
+return other == value ? other + 1 : other;
+#else
+return wp::atomic_cas(values, idx, compare, value);
+#endif
+""")
+def _reduction_cas_slot(values: wp.array[wp.uint64], idx: int, compare: wp.uint64, value: wp.uint64) -> wp.uint64:
+    """64-bit compare-and-swap of a reduction slot on CUDA and CPU (Metal has none)."""
+    ...
+
+
 @wp.func
 def reduction_rollback_slot(
     entry_idx: int,
@@ -261,9 +282,15 @@ def reduction_rollback_slot(
     values: wp.array[wp.uint64],
     capacity: int,
 ):
-    """Restore a displaced value without overwriting a newer winner."""
+    """Restore a displaced value without overwriting a newer winner.
+
+    On Metal the provisional value (contact id 0, which exports skip) stays instead: slots only ever grow there, see
+    ``_reduction_cas_slot``. A rollback only runs after the contact buffer is exhausted.
+    """
+    if _hashtable_use_claims():
+        return
     value_idx = slot_id * capacity + entry_idx
-    wp.atomic_cas(values, value_idx, provisional_value, previous_value)
+    _reduction_cas_slot(values, value_idx, provisional_value, previous_value)
 
 
 @wp.func
@@ -275,9 +302,18 @@ def reduction_finalize_slot(
     values: wp.array[wp.uint64],
     capacity: int,
 ) -> bool:
-    """Atomically transfer a provisional slot claim to its materialized contact."""
+    """Atomically transfer a provisional slot claim to its materialized contact.
+
+    On Metal: ``final_value`` (``provisional_value`` with the contact id in its low bits) is maxed into the slot and the
+    claim holds if the slot then reads ``final_value``. That equals the compare-and-swap's outcome except when the slot
+    holds a value strictly between the two, i.e. a contact with the same score and fingerprint and a smaller id: Metal
+    then keeps the larger id, as the reducer's own max rule would.
+    """
     value_idx = slot_id * capacity + entry_idx
-    return wp.atomic_cas(values, value_idx, provisional_value, final_value) == provisional_value
+    if _hashtable_use_claims():
+        wp.atomic_max(values, value_idx, final_value)
+        return _hashtable_load_key(values, value_idx) == final_value
+    return _reduction_cas_slot(values, value_idx, provisional_value, final_value) == provisional_value
 
 
 @wp.func
